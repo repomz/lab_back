@@ -5,7 +5,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/IdrisovMarat/lab_back/internal/domain"
+	"github.com/repomz/lab_back/internal/domain"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"

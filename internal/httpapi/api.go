@@ -10,13 +10,13 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/IdrisovMarat/lab_back/internal/analyzer"
-	"github.com/IdrisovMarat/lab_back/internal/auth"
-	"github.com/IdrisovMarat/lab_back/internal/config"
-	"github.com/IdrisovMarat/lab_back/internal/domain"
-	"github.com/IdrisovMarat/lab_back/internal/store"
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
+	"github.com/repomz/lab_back/internal/analyzer"
+	"github.com/repomz/lab_back/internal/auth"
+	"github.com/repomz/lab_back/internal/config"
+	"github.com/repomz/lab_back/internal/domain"
+	"github.com/repomz/lab_back/internal/store"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 )

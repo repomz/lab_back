@@ -9,10 +9,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/IdrisovMarat/lab_back/internal/analyzer"
-	"github.com/IdrisovMarat/lab_back/internal/config"
-	"github.com/IdrisovMarat/lab_back/internal/httpapi"
-	"github.com/IdrisovMarat/lab_back/internal/store"
+	"github.com/repomz/lab_back/internal/analyzer"
+	"github.com/repomz/lab_back/internal/config"
+	"github.com/repomz/lab_back/internal/httpapi"
+	"github.com/repomz/lab_back/internal/store"
 )
 
 func main() {

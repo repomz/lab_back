@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/IdrisovMarat/lab_back/internal/config"
-	"github.com/IdrisovMarat/lab_back/internal/domain"
+	"github.com/repomz/lab_back/internal/config"
+	"github.com/repomz/lab_back/internal/domain"
 )
 
 type Service struct {

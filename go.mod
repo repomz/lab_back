@@ -1,4 +1,4 @@
-module github.com/IdrisovMarat/lab_back
+module github.com/repomz/lab_back
 
 go 1.24.3
 
