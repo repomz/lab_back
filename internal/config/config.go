@@ -19,7 +19,7 @@ func Load() Config {
 		MongoDatabase: env("MONGO_DATABASE", "lab"), JWTSecret: env("JWT_SECRET", "development-secret-change-me-please"),
 		UploadDir: env("UPLOAD_DIR", "./data/uploads"), PublicBaseURL: env("PUBLIC_BASE_URL", "http://localhost:8080"),
 		DeepSeekAPIKey: os.Getenv("DEEPSEEK_API_KEY"), DeepSeekBaseURL: env("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-		DeepSeekModel: env("DEEPSEEK_MODEL", "deepseek-chat"), OCRMode: env("OCR_MODE", "local"),
+		DeepSeekModel: env("DEEPSEEK_MODEL", "deepseek-v4-flash"), OCRMode: env("OCR_MODE", "local"),
 		TesseractLang: env("TESSERACT_LANG", "rus+eng"), CORSOrigins: strings.Split(env("CORS_ORIGINS", "http://localhost:8081"), ","),
 		MaxUploadMB: envInt("MAX_UPLOAD_MB", 20),
 	}

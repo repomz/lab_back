@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -47,14 +48,38 @@ func (s *Service) extract(ctx context.Context, path, mime string) (string, error
 		if e == nil && len(bytes.TrimSpace(b)) > 20 {
 			return string(b), nil
 		}
+		tmpDir, e := os.MkdirTemp("", "lab-pdf-ocr-")
+		if e != nil {
+			return "", e
+		}
+		defer os.RemoveAll(tmpDir)
+		prefix := filepath.Join(tmpDir, "page")
+		// Ограничение в 10 страниц защищает API от чрезмерно тяжёлых PDF.
+		cmd := exec.CommandContext(ctx, "pdftoppm", "-png", "-r", "200", "-f", "1", "-l", "10", path, prefix)
+		if output, renderErr := cmd.CombinedOutput(); renderErr != nil {
+			return "", fmt.Errorf("render pdf: %v: %s", renderErr, output)
+		}
+		pages, e := filepath.Glob(prefix + "-*.png")
+		if e != nil || len(pages) == 0 {
+			return "", fmt.Errorf("render pdf: no pages produced")
+		}
+		var text strings.Builder
+		for _, page := range pages {
+			b, ocrErr := exec.CommandContext(ctx, "tesseract", page, "stdout", "-l", s.cfg.TesseractLang).CombinedOutput()
+			if ocrErr != nil {
+				return "", fmt.Errorf("tesseract pdf page: %v: %s", ocrErr, b)
+			}
+			text.Write(b)
+			text.WriteString("\n")
+		}
+		return text.String(), nil
 	}
-	base := strings.TrimSuffix(path, filepath.Ext(path))
-	cmd := exec.CommandContext(ctx, "tesseract", path, base, "-l", s.cfg.TesseractLang)
-	if b, e := cmd.CombinedOutput(); e != nil {
+	cmd := exec.CommandContext(ctx, "tesseract", path, "stdout", "-l", s.cfg.TesseractLang)
+	b, e := cmd.CombinedOutput()
+	if e != nil {
 		return "", fmt.Errorf("tesseract: %v: %s", e, b)
 	}
-	b, e := exec.CommandContext(ctx, "cat", base+".txt").Output()
-	return string(b), e
+	return string(b), nil
 }
 
 var row = regexp.MustCompile(`(?m)^\s*([\p{L}][\p{L}\s\-()/]{2,}?)\s+([<>]?\s*\d+(?:[.,]\d+)?)\s*([%\p{L}/^\d]*)\s*(?:\s+([\d.,]+)\s*[-–]\s*([\d.,]+))?\s*$`)
@@ -103,7 +128,14 @@ func ruleReview(markers []domain.Marker) domain.AIReview {
 }
 func (s *Service) deepSeek(ctx context.Context, text string) ([]domain.Marker, domain.AIReview, error) {
 	type msg struct{ Role, Content string }
-	payload := map[string]any{"model": s.cfg.DeepSeekModel, "temperature": 0.1, "response_format": map[string]string{"type": "json_object"}, "messages": []msg{{"system", "Ты медицинский модуль структурирования лабораторных бланков. Верни только JSON: markers (поля name, canonical_name, value, text_value, unit, reference_min, reference_max, reference_text, status low|normal|high|unknown) и ai_review (summary, lifestyle[], nutrition[], doctor_needed, urgency routine|soon|urgent, suggested_specialty). Не ставь диагноз. Не выдумывай отсутствующие значения."}, {"user", text}}}
+	payload := map[string]any{
+		"model":           s.cfg.DeepSeekModel,
+		"temperature":     0.1,
+		"max_tokens":      4096,
+		"thinking":        map[string]string{"type": "disabled"},
+		"response_format": map[string]string{"type": "json_object"},
+		"messages":        []msg{{"system", "Ты медицинский модуль структурирования лабораторных бланков. Верни только json-объект: markers (поля name, canonical_name, value, text_value, unit, reference_min, reference_max, reference_text, status low|normal|high|unknown) и ai_review (summary, lifestyle[], nutrition[], doctor_needed, urgency routine|soon|urgent, suggested_specialty). Не ставь диагноз. Не выдумывай отсутствующие значения."}, {"user", text}},
+	}
 	b, _ := json.Marshal(payload)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.cfg.DeepSeekBaseURL, "/")+"/chat/completions", bytes.NewReader(b))
 	req.Header.Set("Authorization", "Bearer "+s.cfg.DeepSeekAPIKey)
