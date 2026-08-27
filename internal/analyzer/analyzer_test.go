@@ -21,3 +21,11 @@ func TestEmptyReviewDoesNotClaimRecognition(t *testing.T) {
 		t.Fatalf("unexpected review: %#v", r)
 	}
 }
+
+func TestOCRScorePrefersStructuredLabText(t *testing.T) {
+	structured := "Глюкоза 6,2 ммоль/л 3,9 - 5,5"
+	noisy := "лабораторный результат пациента содержит много отдельных слов без значений"
+	if ocrScore(structured) <= ocrScore(noisy) {
+		t.Fatal("structured OCR result must have a higher score")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -35,9 +36,13 @@ func (s *Service) Process(ctx context.Context, path, mime string) (string, []dom
 	markers := parseMarkers(text)
 	review := ruleReview(markers)
 	if s.cfg.DeepSeekAPIKey != "" && strings.TrimSpace(text) != "" {
-		if m, r, e := s.deepSeek(ctx, text); e == nil {
+		if m, r, e := s.deepSeek(ctx, text); e != nil {
+			log.Printf("deepseek structuring failed: %v", e)
+		} else if len(m) > 0 {
 			markers = m
 			review = r
+		} else {
+			log.Printf("deepseek structuring returned no markers")
 		}
 	}
 	status := "ready"
@@ -70,21 +75,53 @@ func (s *Service) extract(ctx context.Context, path, mime string) (string, error
 		}
 		var text strings.Builder
 		for _, page := range pages {
-			b, ocrErr := exec.CommandContext(ctx, "tesseract", page, "stdout", "-l", s.cfg.TesseractLang).CombinedOutput()
+			pageText, ocrErr := s.extractImage(ctx, page)
 			if ocrErr != nil {
-				return "", fmt.Errorf("tesseract pdf page: %v: %s", ocrErr, b)
+				return "", fmt.Errorf("tesseract pdf page: %w", ocrErr)
 			}
-			text.Write(b)
+			text.WriteString(pageText)
 			text.WriteString("\n")
 		}
 		return text.String(), nil
 	}
-	cmd := exec.CommandContext(ctx, "tesseract", path, "stdout", "-l", s.cfg.TesseractLang)
-	b, e := cmd.CombinedOutput()
-	if e != nil {
-		return "", fmt.Errorf("tesseract: %v: %s", e, b)
+	return s.extractImage(ctx, path)
+}
+
+func (s *Service) extractImage(ctx context.Context, path string) (string, error) {
+	var candidates []string
+	var lastErr error
+	// PSM 6 лучше сохраняет строки таблиц, PSM 11 находит разреженный текст
+	// на фотографиях с полями, печатями и неровными отступами.
+	for _, psm := range []string{"6", "11"} {
+		cmd := exec.CommandContext(ctx, "tesseract", path, "stdout", "-l", s.cfg.TesseractLang, "--psm", psm, "-c", "preserve_interword_spaces=1")
+		b, err := cmd.CombinedOutput()
+		if err != nil {
+			lastErr = fmt.Errorf("psm %s: %v: %s", psm, err, b)
+			continue
+		}
+		if strings.TrimSpace(string(b)) != "" {
+			candidates = append(candidates, string(b))
+		}
 	}
-	return string(b), nil
+	if len(candidates) == 0 {
+		if lastErr != nil {
+			return "", lastErr
+		}
+		return "", fmt.Errorf("tesseract returned empty text")
+	}
+	best := candidates[0]
+	bestScore := ocrScore(best)
+	for _, candidate := range candidates[1:] {
+		if score := ocrScore(candidate); score > bestScore {
+			best = candidate
+			bestScore = score
+		}
+	}
+	return best, nil
+}
+
+func ocrScore(text string) int {
+	return len(parseMarkers(text))*10000 + len(strings.Fields(text))
 }
 
 var row = regexp.MustCompile(`(?m)^\s*([\p{L}][\p{L}\s\-()/]{2,}?)\s+([<>]?\s*\d+(?:[.,]\d+)?)\s*([%\p{L}/^\d]*)\s*(?:\s+([\d.,]+)\s*[-–]\s*([\d.,]+))?\s*$`)
