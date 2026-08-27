@@ -116,9 +116,12 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 	}
 	in.Email = strings.ToLower(strings.TrimSpace(in.Email))
 	in.FullName = strings.TrimSpace(in.FullName)
+	if in.FullName == "" {
+		in.FullName = in.Email
+	}
 	role := domain.Role(in.Role)
-	if !strings.Contains(in.Email, "@") || len(in.Password) < 8 || in.FullName == "" || (role != domain.RolePatient && role != domain.RoleDoctor) {
-		write(w, 422, map[string]string{"error": "email, full_name, role and password of at least 8 characters are required"})
+	if in.Email == "" || in.Password == "" || (role != domain.RolePatient && role != domain.RoleDoctor) {
+		write(w, 422, map[string]string{"error": "логин, пароль и роль обязательны"})
 		return
 	}
 	if role == domain.RoleDoctor && strings.TrimSpace(in.Specialization) == "" {
@@ -133,7 +136,7 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 	u := domain.User{Email: in.Email, PasswordHash: h, Role: role, FullName: in.FullName, Specialization: strings.TrimSpace(in.Specialization), LicenseNumber: strings.TrimSpace(in.LicenseNumber)}
 	if e = a.store.CreateUser(r.Context(), &u); e != nil {
 		if mongo.IsDuplicateKeyError(e) {
-			write(w, 409, map[string]string{"error": "email already registered"})
+			write(w, 409, map[string]string{"error": "такой логин уже занят"})
 			return
 		}
 		write(w, 500, map[string]string{"error": "registration failed"})
@@ -236,8 +239,8 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 	if title == "" {
 		title = strings.TrimSuffix(filepath.Base(header.Filename), ext)
 	}
-	text, markers, review := a.analyzer.Process(r.Context(), path, mime)
-	item := domain.Analysis{OwnerID: u.ID, Title: title, OriginalName: filepath.Base(header.Filename), MimeType: mime, StoragePath: path, OCRText: text, Markers: markers, AIReview: review, Status: "ready", SharedWith: []primitive.ObjectID{}}
+	text, markers, review, status := a.analyzer.Process(r.Context(), path, mime)
+	item := domain.Analysis{OwnerID: u.ID, Title: title, OriginalName: filepath.Base(header.Filename), MimeType: mime, StoragePath: path, OCRText: text, Markers: markers, AIReview: review, Status: status, SharedWith: []primitive.ObjectID{}}
 	item.ID = id
 	if e = a.store.CreateAnalysis(r.Context(), &item); e != nil {
 		_ = os.Remove(path)

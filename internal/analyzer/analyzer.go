@@ -27,20 +27,25 @@ func New(cfg config.Config) *Service {
 	return &Service{cfg: cfg, client: &http.Client{Timeout: 60 * time.Second}}
 }
 
-func (s *Service) Process(ctx context.Context, path, mime string) (string, []domain.Marker, domain.AIReview) {
+func (s *Service) Process(ctx context.Context, path, mime string) (string, []domain.Marker, domain.AIReview, string) {
 	text, err := s.extract(ctx, path, mime)
 	if err != nil {
-		text = ""
+		return "", []domain.Marker{}, failedReview(), "failed"
 	}
 	markers := parseMarkers(text)
 	review := ruleReview(markers)
-	if s.cfg.DeepSeekAPIKey != "" {
+	if s.cfg.DeepSeekAPIKey != "" && strings.TrimSpace(text) != "" {
 		if m, r, e := s.deepSeek(ctx, text); e == nil {
 			markers = m
 			review = r
 		}
 	}
-	return text, markers, review
+	status := "ready"
+	if len(markers) == 0 {
+		status = "needs_review"
+		review = emptyReview()
+	}
+	return text, markers, review, status
 }
 func (s *Service) extract(ctx context.Context, path, mime string) (string, error) {
 	if strings.Contains(mime, "pdf") {
@@ -125,6 +130,14 @@ func ruleReview(markers []domain.Marker) domain.AIReview {
 		need = true
 	}
 	return domain.AIReview{Summary: summary, Lifestyle: []string{"Сохраняйте обычный режим сна и физической активности, если врач не рекомендовал иное."}, Nutrition: []string{"Не меняйте рацион радикально только на основании одного анализа."}, DoctorNeeded: need, Urgency: urg, Disclaimer: "Автоматическая оценка не является диагнозом и не заменяет консультацию врача. При резком ухудшении самочувствия обратитесь за неотложной помощью.", Provider: "rules"}
+}
+
+func emptyReview() domain.AIReview {
+	return domain.AIReview{Summary: "Текст документа считан, но отдельные показатели автоматически выделить не удалось. Откройте оригинал и попробуйте загрузить более чёткое фото.", Lifestyle: []string{}, Nutrition: []string{}, DoctorNeeded: false, Urgency: "routine", Disclaimer: "Автоматическая обработка не является диагнозом и не заменяет консультацию врача.", Provider: "rules"}
+}
+
+func failedReview() domain.AIReview {
+	return domain.AIReview{Summary: "Не удалось распознать документ. Оригинал сохранён — попробуйте загрузить более чёткое фото или PDF.", Lifestyle: []string{}, Nutrition: []string{}, DoctorNeeded: false, Urgency: "routine", Disclaimer: "Автоматическая обработка не является диагнозом и не заменяет консультацию врача.", Provider: "rules"}
 }
 func (s *Service) deepSeek(ctx context.Context, text string) ([]domain.Marker, domain.AIReview, error) {
 	type msg struct{ Role, Content string }

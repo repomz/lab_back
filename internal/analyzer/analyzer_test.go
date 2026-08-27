@@ -14,3 +14,10 @@ func TestParseMarkers(t *testing.T) {
 		t.Fatalf("status %s", m[1].Status)
 	}
 }
+
+func TestEmptyReviewDoesNotClaimRecognition(t *testing.T) {
+	r := emptyReview()
+	if r.Summary == "" || r.Provider != "rules" {
+		t.Fatalf("unexpected review: %#v", r)
+	}
+}
