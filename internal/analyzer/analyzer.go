@@ -88,12 +88,20 @@ func (s *Service) extract(ctx context.Context, path, mime string) (string, error
 }
 
 func (s *Service) extractImage(ctx context.Context, path string) (string, error) {
+	ocrPath, cleanup, preprocessErr := preprocessImage(ctx, path)
+	if cleanup != nil {
+		defer cleanup()
+	}
+	if preprocessErr != nil {
+		log.Printf("image preprocessing failed, using original: %v", preprocessErr)
+		ocrPath = path
+	}
 	var candidates []string
 	var lastErr error
-	// PSM 6 лучше сохраняет строки таблиц, PSM 11 находит разреженный текст
-	// на фотографиях с полями, печатями и неровными отступами.
-	for _, psm := range []string{"6", "11"} {
-		cmd := exec.CommandContext(ctx, "tesseract", path, "stdout", "-l", s.cfg.TesseractLang, "--psm", psm, "-c", "preserve_interword_spaces=1")
+	// PSM 4 лучше видит колонки, PSM 6 — строки таблиц, PSM 11 —
+	// разреженный текст на фотографиях с полями и печатями.
+	for _, psm := range []string{"4", "6", "11"} {
+		cmd := exec.CommandContext(ctx, "tesseract", ocrPath, "stdout", "-l", s.cfg.TesseractLang, "--psm", psm, "-c", "preserve_interword_spaces=1")
 		b, err := cmd.CombinedOutput()
 		if err != nil {
 			lastErr = fmt.Errorf("psm %s: %v: %s", psm, err, b)
@@ -120,8 +128,34 @@ func (s *Service) extractImage(ctx context.Context, path string) (string, error)
 	return best, nil
 }
 
+// preprocessImage fixes the EXIF orientation commonly produced by phone cameras,
+// normalizes uneven lighting and removes a small camera tilt before OCR. Tesseract
+// does not reliably apply EXIF orientation itself.
+func preprocessImage(ctx context.Context, path string) (string, func(), error) {
+	tmpDir, err := os.MkdirTemp("", "lab-image-ocr-")
+	if err != nil {
+		return path, nil, err
+	}
+	cleanup := func() { _ = os.RemoveAll(tmpDir) }
+	outputPath := filepath.Join(tmpDir, "normalized.png")
+	cmd := exec.CommandContext(ctx, "magick", path, "-auto-orient", "-colorspace", "Gray", "-deskew", "40%", "-contrast-stretch", "1%x1%", "-sharpen", "0x1", outputPath)
+	if output, commandErr := cmd.CombinedOutput(); commandErr != nil {
+		cleanup()
+		return path, nil, fmt.Errorf("magick: %v: %s", commandErr, output)
+	}
+	return outputPath, cleanup, nil
+}
+
 func ocrScore(text string) int {
-	return len(parseMarkers(text))*10000 + len(strings.Fields(text))
+	decimalValues := len(regexp.MustCompile(`\d+[.,]\d+`).FindAllString(text, -1))
+	lower := strings.ToLower(text)
+	labTerms := 0
+	for _, term := range []string{"глюкоз", "альбумин", "билирубин", "креатинин", "мочевин", "холестерин"} {
+		if strings.Contains(lower, term) {
+			labTerms++
+		}
+	}
+	return len(parseMarkers(text))*10000 + decimalValues*200 + labTerms*100 + len(strings.Fields(text))
 }
 
 var row = regexp.MustCompile(`(?m)^\s*([\p{L}][\p{L}\s\-()/]{2,}?)\s+([<>]?\s*\d+(?:[.,]\d+)?)\s*([%\p{L}/^\d]*)\s*(?:\s+([\d.,]+)\s*[-–]\s*([\d.,]+))?\s*$`)
