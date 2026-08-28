@@ -49,6 +49,9 @@ func (s *Service) Process(ctx context.Context, path, mime string) (string, []dom
 	if len(markers) == 0 {
 		status = "needs_review"
 		review = emptyReview()
+	} else if markersNeedReview(markers) {
+		status = "needs_review"
+		review.Summary += " Часть полей распознана неуверенно — сверьте их с оригиналом."
 	}
 	return text, markers, review, status
 }
@@ -161,17 +164,65 @@ func ocrScore(text string) int {
 	return len(parseMarkers(text))*10000 + decimalValues*200 + labTerms*100 + len(strings.Fields(text))
 }
 
-var row = regexp.MustCompile(`(?m)^\s*([\p{L}][\p{L}\s\-()/]{2,}?)\s+([<>]?\s*\d+(?:[.,]\d+)?)\s*([%\p{L}/^\d]*)\s*(?:\s+([\d.,]+)\s*[-–]\s*([\d.,]+))?\s*$`)
+type markerSpec struct {
+	name, canonical, unit string
+	aliases               []string
+	maxPlausible          float64
+}
+
+var markerSpecs = []markerSpec{
+	{"Глюкоза", "glucose", "ммоль/л", []string{"глюкоз"}, 100},
+	{"Альбумин", "albumin", "г/л", []string{"альбумин"}, 100},
+	{"Билирубин общий", "bilirubin_total", "мкмоль/л", []string{"билирубин общий"}, 1000},
+	{"Билирубин прямой", "bilirubin_direct", "мкмоль/л", []string{"билирубин прямой"}, 500},
+	{"АЛТ", "alt", "Ед/л", []string{"алт"}, 10000},
+	{"АСТ", "ast", "Ед/л", []string{"аст", "act"}, 10000},
+	{"Холестерин общий", "cholesterol_total", "ммоль/л", []string{"холестерин общий"}, 100},
+	{"Триглицериды", "triglycerides", "ммоль/л", []string{"триглицерид"}, 100},
+	{"ЛПВП", "hdl", "ммоль/л", []string{"лпвп", "nnen"}, 20},
+	{"ЛПНП", "ldl", "ммоль/л", []string{"лпнп", "аннп", "anhn"}, 30},
+	{"Мочевина", "urea", "ммоль/л", []string{"мочевин"}, 100},
+	{"Креатинин", "creatinine", "мкмоль/л", []string{"креатинин"}, 2000},
+	{"СКФ", "egfr", "мл/мин/1,73 м²", []string{"фильтрац"}, 200},
+	{"СРБ", "crp", "мг/л", []string{"срб", "cpb"}, 1000},
+	{"Мочевая кислота", "uric_acid", "мкмоль/л", []string{"мочевая кислота", "mouebas кислота"}, 2000},
+	{"Железо", "iron", "мкмоль/л", []string{"железо"}, 200},
+	{"Кальций общий", "calcium_total", "ммоль/л", []string{"кальций"}, 10},
+	{"Калий", "potassium", "ммоль/л", []string{"калий"}, 20},
+	{"Натрий", "sodium", "ммоль/л", []string{"натрий"}, 200},
+}
+
+var (
+	row              = regexp.MustCompile(`(?m)^[ \t]*([\p{L}][\p{L} \t\-()/]{2,}?)[ \t]+([<>]?[ \t]*\d+(?:[.,]\d+)?)[ \t]*([%\p{L}/^\d]*)[ \t]*(?:[ \t]+([\d.,]+)[ \t]*[-–][ \t]*([\d.,]+))?[ \t]*$`)
+	numberToken      = regexp.MustCompile(`(?:>=|<=|>|<)?[ \t]*\d+(?:[.,]\d+)?`)
+	rangeToken       = regexp.MustCompile(`(\d+(?:[.,]\d+)?)[ \t]*[-–=][ \t]*(\d+(?:[.,]\d+)?)`)
+	thresholdToken   = regexp.MustCompile(`(>=|<=|>|<)[ \t]*(\d+(?:[.,]\d+)?)`)
+	leadingParenCode = regexp.MustCompile(`^[ \t]*\([^)]*\)`)
+)
 
 func parseMarkers(text string) []domain.Marker {
-	out := []domain.Marker{}
+	known := parseKnownMarkers(text)
+	if len(known) >= 3 {
+		return known
+	}
+
+	out := append([]domain.Marker{}, known...)
+	seen := map[string]bool{}
+	for _, marker := range known {
+		seen[marker.CanonicalName] = true
+	}
 	for _, m := range row.FindAllStringSubmatch(text, -1) {
 		raw := strings.ReplaceAll(strings.TrimSpace(strings.TrimLeft(m[2], "<> ")), ",", ".")
 		v, e := strconv.ParseFloat(raw, 64)
 		if e != nil {
 			continue
 		}
-		mk := domain.Marker{Name: strings.TrimSpace(m[1]), CanonicalName: strings.ToLower(strings.TrimSpace(m[1])), Value: &v, Unit: strings.TrimSpace(m[3]), Status: domain.StatusUnknown}
+		name := strings.TrimSpace(m[1])
+		canonical := strings.ToLower(name)
+		if seen[canonical] || isKnownMarkerLabel(canonical) || (strings.TrimSpace(m[3]) == "" && m[4] == "") || isAdministrativeLabel(canonical) {
+			continue
+		}
+		mk := domain.Marker{Name: name, CanonicalName: canonical, Value: &v, Unit: strings.TrimSpace(m[3]), Status: domain.StatusUnknown}
 		if m[4] != "" {
 			a, _ := strconv.ParseFloat(strings.ReplaceAll(m[4], ",", "."), 64)
 			b, _ := strconv.ParseFloat(strings.ReplaceAll(m[5], ",", "."), 64)
@@ -186,8 +237,190 @@ func parseMarkers(text string) []domain.Marker {
 			}
 		}
 		out = append(out, mk)
+		seen[canonical] = true
 	}
 	return out
+}
+
+func parseKnownMarkers(text string) []domain.Marker {
+	found := map[string]domain.Marker{}
+	for _, rawLine := range strings.Split(text, "\n") {
+		line := strings.TrimSpace(rawLine)
+		lower := strings.ToLower(strings.ReplaceAll(line, "ё", "е"))
+		for _, spec := range markerSpecs {
+			if _, exists := found[spec.canonical]; exists {
+				continue
+			}
+			alias, index := matchedAlias(lower, spec.aliases)
+			if index < 0 {
+				continue
+			}
+			after := leadingParenCode.ReplaceAllString(lower[index+len(alias):], "")
+			numbers := numberToken.FindAllString(after, -1)
+			if len(numbers) == 0 {
+				continue
+			}
+			value, ok := parseOCRNumber(numbers[0])
+			if !ok {
+				continue
+			}
+			value = normalizeMarkerValue(value, numbers[0], spec.maxPlausible)
+			marker := domain.Marker{Name: spec.name, CanonicalName: spec.canonical, Value: floatPtr(value), Unit: spec.unit, Status: domain.StatusUnknown}
+			prefix := lower[:index]
+			hint := domain.StatusUnknown
+			if strings.Contains(prefix, ">") {
+				hint = domain.StatusHigh
+			} else if strings.Contains(prefix, "<") {
+				hint = domain.StatusLow
+			}
+			if match := rangeToken.FindStringSubmatch(after); len(match) == 3 {
+				a, okA := parseOCRNumber(match[1])
+				b, okB := parseOCRNumber(match[2])
+				if okA && okB {
+					a, b = normalizeReferenceRange(value, a, b, hint)
+					marker.ReferenceMin, marker.ReferenceMax = floatPtr(a), floatPtr(b)
+					marker.ReferenceText = formatReference(a, b)
+					marker.Status = statusForRange(value, a, b)
+				}
+			} else if match := thresholdToken.FindStringSubmatch(after); len(match) == 3 {
+				threshold, okThreshold := parseOCRNumber(match[2])
+				if okThreshold {
+					marker.ReferenceText = match[1] + " " + formatNumber(threshold)
+					switch match[1] {
+					case ">", ">=":
+						marker.ReferenceMin = floatPtr(threshold)
+						if value < threshold {
+							marker.Status = domain.StatusLow
+						} else {
+							marker.Status = domain.StatusNormal
+						}
+					case "<", "<=":
+						marker.ReferenceMax = floatPtr(threshold)
+						if value > threshold {
+							marker.Status = domain.StatusHigh
+						} else {
+							marker.Status = domain.StatusNormal
+						}
+					}
+				}
+			}
+			if hint != domain.StatusUnknown {
+				marker.Status = hint
+			}
+			found[spec.canonical] = marker
+		}
+	}
+	out := make([]domain.Marker, 0, len(found))
+	for _, spec := range markerSpecs {
+		if marker, ok := found[spec.canonical]; ok {
+			out = append(out, marker)
+		}
+	}
+	return out
+}
+
+func matchedAlias(line string, aliases []string) (string, int) {
+	for _, alias := range aliases {
+		if index := strings.Index(line, alias); index >= 0 {
+			return alias, index
+		}
+	}
+	return "", -1
+}
+
+func parseOCRNumber(raw string) (float64, bool) {
+	clean := strings.NewReplacer(">=", "", "<=", "", ">", "", "<", "", " ", "", ",", ".").Replace(raw)
+	value, err := strconv.ParseFloat(clean, 64)
+	return value, err == nil
+}
+
+func normalizeMarkerValue(value float64, raw string, maxPlausible float64) float64 {
+	if strings.ContainsAny(raw, ",.") || maxPlausible <= 0 {
+		return value
+	}
+	for value > maxPlausible {
+		value /= 10
+	}
+	return value
+}
+
+func normalizeReferenceRange(value, rawMin, rawMax float64, hint domain.MarkerStatus) (float64, float64) {
+	if value == 0 {
+		return rawMin, rawMax
+	}
+	bestMin, bestMax := rawMin, rawMax
+	bestScore := 1.7976931348623157e+308
+	for minScale, minDivisor := 0, 1.0; minScale <= 3; minScale, minDivisor = minScale+1, minDivisor*10 {
+		for maxScale, maxDivisor := 0, 1.0; maxScale <= 3; maxScale, maxDivisor = maxScale+1, maxDivisor*10 {
+			minValue, maxValue := rawMin/minDivisor, rawMax/maxDivisor
+			if minValue > maxValue {
+				continue
+			}
+			valid := minValue <= value && value <= maxValue
+			if hint == domain.StatusHigh {
+				valid = minValue <= value && value > maxValue
+			} else if hint == domain.StatusLow {
+				valid = value < minValue && value <= maxValue
+			}
+			score := maxValue - minValue
+			if hint == domain.StatusHigh {
+				score += (value - maxValue) * 1000
+			} else if hint == domain.StatusLow {
+				score += (minValue - value) * 1000
+			}
+			if valid && score < bestScore {
+				bestMin, bestMax, bestScore = minValue, maxValue, score
+			}
+		}
+	}
+	return bestMin, bestMax
+}
+
+func statusForRange(value, minValue, maxValue float64) domain.MarkerStatus {
+	if value < minValue {
+		return domain.StatusLow
+	}
+	if value > maxValue {
+		return domain.StatusHigh
+	}
+	return domain.StatusNormal
+}
+
+func formatReference(minValue, maxValue float64) string {
+	return formatNumber(minValue) + " - " + formatNumber(maxValue)
+}
+
+func formatNumber(value float64) string {
+	return strings.ReplaceAll(strconv.FormatFloat(value, 'f', -1, 64), ".", ",")
+}
+
+func floatPtr(value float64) *float64 { return &value }
+
+func isAdministrativeLabel(name string) bool {
+	for _, label := range []string{"окпо", "инн", "кпп", "фио", "полис", "образца", "карты", "тел"} {
+		if strings.Contains(name, label) {
+			return true
+		}
+	}
+	return false
+}
+
+func isKnownMarkerLabel(name string) bool {
+	for _, spec := range markerSpecs {
+		if _, index := matchedAlias(strings.ToLower(strings.ReplaceAll(name, "ё", "е")), spec.aliases); index >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func markersNeedReview(markers []domain.Marker) bool {
+	for _, marker := range markers {
+		if marker.Value == nil || marker.Status == domain.StatusUnknown || marker.Unit == "" {
+			return true
+		}
+	}
+	return false
 }
 func ruleReview(markers []domain.Marker) domain.AIReview {
 	abnormal := 0
