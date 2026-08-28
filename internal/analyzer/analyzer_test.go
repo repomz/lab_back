@@ -149,6 +149,13 @@ func TestMultipleOCRPassesDoNotLetShiftedColumnsOverrideClearRow(t *testing.T) {
 	}
 }
 
+func TestOCRGroupCodeIsNotUsedAsTriglycerideValue(t *testing.T) {
+	markers := parseMarkers("Триглицериды (1) 1,40 0,55-1,65 ммоль/л")
+	if len(markers) != 1 || markers[0].Value == nil || math.Abs(*markers[0].Value-1.4) > 0.001 {
+		t.Fatalf("unexpected triglycerides: %#v", markers)
+	}
+}
+
 func TestExternalModelCannotOverrideConflictingLocalValue(t *testing.T) {
 	value, wrong := 4.77, 47.7
 	local := []domain.Marker{{Name: "Глюкоза", CanonicalName: "glucose", Value: &value, Unit: "ммоль/л", Status: domain.StatusNormal, Confidence: 0.94}}
