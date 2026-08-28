@@ -90,6 +90,16 @@ func (s *Mongo) Share(ctx context.Context, analysis, owner, doctor primitive.Obj
 	}
 	return err
 }
+func (s *Mongo) UpdateAnalysisRecognition(ctx context.Context, id, owner primitive.ObjectID, text string, markers []domain.Marker, review domain.AIReview, status string) error {
+	r, err := s.db.Collection("analyses").UpdateOne(ctx,
+		bson.M{"_id": id, "owner_id": owner},
+		bson.M{"$set": bson.M{"ocr_text": text, "markers": markers, "ai_review": review, "status": status, "updated_at": time.Now().UTC()}},
+	)
+	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
 func (s *Mongo) CreateConsultation(ctx context.Context, c *domain.Consultation) error {
 	c.ID = primitive.NewObjectID()
 	now := time.Now().UTC()

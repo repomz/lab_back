@@ -94,3 +94,70 @@ nnen 1,69 0,78-2,07 ммоль/л
 		t.Fatal("an uncertain field must require review")
 	}
 }
+
+func TestParseSparseOCRCells(t *testing.T) {
+	text := `
+"Кальций общий
+Кальций (Ca)
+2,330
+2-26
+ммоль/л
+"Калий
+Калий (K)
+4,40
+36-55
+ммоль/л
+"Натрий
+144,0
+135 = 150
+ммоль/л`
+	markers := parseMarkers(text)
+	byName := map[string]domain.Marker{}
+	for _, marker := range markers {
+		byName[marker.CanonicalName] = marker
+	}
+	if len(markers) != 3 {
+		t.Fatalf("got %d markers: %#v", len(markers), markers)
+	}
+	if got := *byName["calcium_total"].Value; math.Abs(got-2.33) > 0.001 {
+		t.Fatalf("calcium=%g", got)
+	}
+	if got := *byName["calcium_total"].ReferenceMax; math.Abs(got-2.6) > 0.001 {
+		t.Fatalf("calcium max=%g", got)
+	}
+	if got := *byName["potassium"].Value; math.Abs(got-4.4) > 0.001 {
+		t.Fatalf("potassium=%g", got)
+	}
+	if got := *byName["sodium"].ReferenceMax; math.Abs(got-150) > 0.001 {
+		t.Fatalf("sodium max=%g", got)
+	}
+}
+
+func TestMultipleOCRPassesDoNotLetShiftedColumnsOverrideClearRow(t *testing.T) {
+	clear := "Альбумин 44,60 36-50 г/л\nБилирубин общий 5,83 3,4-20,5 мкмоль/л"
+	sparse := "Альбумин\n36\n36-50\nг/л\nБилирубин общий\n583\n3,4-20,5\nмкмоль/л"
+	markers := parseOCRCandidates([]string{clear, sparse})
+	byName := map[string]domain.Marker{}
+	for _, marker := range markers {
+		byName[marker.CanonicalName] = marker
+	}
+	if got := *byName["albumin"].Value; math.Abs(got-44.6) > 0.001 {
+		t.Fatalf("albumin=%g", got)
+	}
+	if got := *byName["bilirubin_total"].Value; math.Abs(got-5.83) > 0.001 {
+		t.Fatalf("bilirubin=%g", got)
+	}
+}
+
+func TestExternalModelCannotOverrideConflictingLocalValue(t *testing.T) {
+	value, wrong := 4.77, 47.7
+	local := []domain.Marker{{Name: "Глюкоза", CanonicalName: "glucose", Value: &value, Unit: "ммоль/л", Status: domain.StatusNormal, Confidence: 0.94}}
+	external := normalizeExternalMarkers([]domain.Marker{{Name: "Глюкоза", CanonicalName: "glucose", Value: &wrong}})
+	merged := mergeMarkerSets(local, external)
+	if len(merged) != 1 || merged[0].Value == nil || *merged[0].Value != value {
+		t.Fatalf("unexpected merge: %#v", merged)
+	}
+	if merged[0].Confidence >= local[0].Confidence {
+		t.Fatal("a disagreement must lower confidence")
+	}
+}

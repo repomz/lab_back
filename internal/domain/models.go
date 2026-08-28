@@ -44,6 +44,8 @@ type Marker struct {
 	ReferenceMax  *float64     `bson:"reference_max,omitempty" json:"reference_max,omitempty"`
 	ReferenceText string       `bson:"reference_text,omitempty" json:"reference_text,omitempty"`
 	Status        MarkerStatus `bson:"status" json:"status"`
+	Confidence    float64      `bson:"confidence,omitempty" json:"confidence,omitempty"`
+	Warnings      []string     `bson:"warnings,omitempty" json:"warnings,omitempty"`
 }
 
 type AIReview struct {

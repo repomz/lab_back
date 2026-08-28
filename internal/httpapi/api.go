@@ -49,6 +49,7 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Post("/api/v1/analyses", api.upload)
 		r.Get("/api/v1/analyses/{id}", api.analysis)
 		r.Get("/api/v1/analyses/{id}/file", api.file)
+		r.Post("/api/v1/analyses/{id}/reprocess", api.reprocess)
 		r.Post("/api/v1/analyses/{id}/share", api.share)
 		r.Get("/api/v1/consultations", api.consultations)
 		r.Post("/api/v1/consultations", api.createConsultation)
@@ -292,6 +293,34 @@ func (a *API) file(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", item.MimeType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", item.OriginalName))
 	http.ServeFile(w, r, item.StoragePath)
+}
+func (a *API) reprocess(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RolePatient {
+		write(w, 403, map[string]string{"error": "only patients can reprocess analyses"})
+		return
+	}
+	id, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		write(w, 400, map[string]string{"error": "invalid id"})
+		return
+	}
+	item, err := a.store.Analysis(r.Context(), id)
+	if err != nil || item.OwnerID != u.ID {
+		write(w, 404, map[string]string{"error": "analysis not found"})
+		return
+	}
+	if _, err = os.Stat(item.StoragePath); err != nil {
+		write(w, 404, map[string]string{"error": "original file not found"})
+		return
+	}
+	text, markers, review, status := a.analyzer.Process(r.Context(), item.StoragePath, item.MimeType)
+	if err = a.store.UpdateAnalysisRecognition(r.Context(), id, u.ID, text, markers, review, status); err != nil {
+		write(w, 500, map[string]string{"error": "could not update recognition"})
+		return
+	}
+	item.OCRText, item.Markers, item.AIReview, item.Status = text, markers, review, status
+	write(w, 200, item)
 }
 func (a *API) share(w http.ResponseWriter, r *http.Request) {
 	u := current(r)

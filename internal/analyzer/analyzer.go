@@ -29,18 +29,21 @@ func New(cfg config.Config) *Service {
 }
 
 func (s *Service) Process(ctx context.Context, path, mime string) (string, []domain.Marker, domain.AIReview, string) {
-	text, err := s.extract(ctx, path, mime)
+	text, candidates, err := s.extract(ctx, path, mime)
 	if err != nil {
 		return "", []domain.Marker{}, failedReview(), "failed"
 	}
-	markers := parseMarkers(text)
+	markers := parseOCRCandidates(candidates)
 	review := ruleReview(markers)
 	if s.cfg.DeepSeekAPIKey != "" && strings.TrimSpace(text) != "" {
 		if m, r, e := s.deepSeek(ctx, text); e != nil {
 			log.Printf("deepseek structuring failed: %v", e)
 		} else if len(m) > 0 {
-			markers = m
-			review = r
+			// An external language model may fill gaps, but it must never replace a
+			// stronger value that was read consistently by local OCR passes.
+			markers = mergeMarkerSets(markers, normalizeExternalMarkers(m))
+			review = ruleReview(markers)
+			review.Provider = r.Provider
 		} else {
 			log.Printf("deepseek structuring returned no markers")
 		}
@@ -55,42 +58,63 @@ func (s *Service) Process(ctx context.Context, path, mime string) (string, []dom
 	}
 	return text, markers, review, status
 }
-func (s *Service) extract(ctx context.Context, path, mime string) (string, error) {
+func (s *Service) extract(ctx context.Context, path, mime string) (string, []string, error) {
 	if strings.Contains(mime, "pdf") {
 		b, e := exec.CommandContext(ctx, "pdftotext", "-layout", path, "-").Output()
 		if e == nil && len(bytes.TrimSpace(b)) > 20 {
-			return string(b), nil
+			return string(b), []string{string(b)}, nil
 		}
 		tmpDir, e := os.MkdirTemp("", "lab-pdf-ocr-")
 		if e != nil {
-			return "", e
+			return "", nil, e
 		}
 		defer os.RemoveAll(tmpDir)
 		prefix := filepath.Join(tmpDir, "page")
 		// Ограничение в 10 страниц защищает API от чрезмерно тяжёлых PDF.
 		cmd := exec.CommandContext(ctx, "pdftoppm", "-png", "-r", "200", "-f", "1", "-l", "10", path, prefix)
 		if output, renderErr := cmd.CombinedOutput(); renderErr != nil {
-			return "", fmt.Errorf("render pdf: %v: %s", renderErr, output)
+			return "", nil, fmt.Errorf("render pdf: %v: %s", renderErr, output)
 		}
 		pages, e := filepath.Glob(prefix + "-*.png")
 		if e != nil || len(pages) == 0 {
-			return "", fmt.Errorf("render pdf: no pages produced")
+			return "", nil, fmt.Errorf("render pdf: no pages produced")
 		}
 		var text strings.Builder
+		var passTexts []strings.Builder
 		for _, page := range pages {
-			pageText, ocrErr := s.extractImage(ctx, page)
+			pageText, pageCandidates, ocrErr := s.extractImageDetailed(ctx, page)
 			if ocrErr != nil {
-				return "", fmt.Errorf("tesseract pdf page: %w", ocrErr)
+				return "", nil, fmt.Errorf("tesseract pdf page: %w", ocrErr)
 			}
 			text.WriteString(pageText)
 			text.WriteString("\n")
+			for i, candidate := range pageCandidates {
+				for len(passTexts) <= i {
+					passTexts = append(passTexts, strings.Builder{})
+				}
+				passTexts[i].WriteString(candidate)
+				passTexts[i].WriteString("\n")
+			}
 		}
-		return text.String(), nil
+		combined := text.String()
+		candidates := make([]string, 0, len(passTexts))
+		for i := range passTexts {
+			candidates = append(candidates, passTexts[i].String())
+		}
+		if len(candidates) == 0 {
+			candidates = []string{combined}
+		}
+		return combined, candidates, nil
 	}
-	return s.extractImage(ctx, path)
+	return s.extractImageDetailed(ctx, path)
 }
 
 func (s *Service) extractImage(ctx context.Context, path string) (string, error) {
+	text, _, err := s.extractImageDetailed(ctx, path)
+	return text, err
+}
+
+func (s *Service) extractImageDetailed(ctx context.Context, path string) (string, []string, error) {
 	ocrPath, cleanup, preprocessErr := preprocessImage(ctx, path)
 	if cleanup != nil {
 		defer cleanup()
@@ -116,9 +140,9 @@ func (s *Service) extractImage(ctx context.Context, path string) (string, error)
 	}
 	if len(candidates) == 0 {
 		if lastErr != nil {
-			return "", lastErr
+			return "", nil, lastErr
 		}
-		return "", fmt.Errorf("tesseract returned empty text")
+		return "", nil, fmt.Errorf("tesseract returned empty text")
 	}
 	best := candidates[0]
 	bestScore := ocrScore(best)
@@ -128,7 +152,7 @@ func (s *Service) extractImage(ctx context.Context, path string) (string, error)
 			bestScore = score
 		}
 	}
-	return best, nil
+	return best, candidates, nil
 }
 
 // preprocessImage fixes the EXIF orientation commonly produced by phone cameras,
@@ -197,7 +221,7 @@ var (
 	numberToken      = regexp.MustCompile(`(?:>=|<=|>|<)?[ \t]*\d+(?:[.,]\d+)?`)
 	rangeToken       = regexp.MustCompile(`(\d+(?:[.,]\d+)?)[ \t]*[-–=][ \t]*(\d+(?:[.,]\d+)?)`)
 	thresholdToken   = regexp.MustCompile(`(>=|<=|>|<)[ \t]*(\d+(?:[.,]\d+)?)`)
-	leadingParenCode = regexp.MustCompile(`^[ \t]*\([^)]*\)`)
+	leadingParenCode = regexp.MustCompile(`^[ \t]*\([^)]{0,12}(?:\)|[ \t]+)`)
 )
 
 func parseMarkers(text string) []domain.Marker {
@@ -222,7 +246,7 @@ func parseMarkers(text string) []domain.Marker {
 		if seen[canonical] || isKnownMarkerLabel(canonical) || (strings.TrimSpace(m[3]) == "" && m[4] == "") || isAdministrativeLabel(canonical) {
 			continue
 		}
-		mk := domain.Marker{Name: name, CanonicalName: canonical, Value: &v, Unit: strings.TrimSpace(m[3]), Status: domain.StatusUnknown}
+		mk := domain.Marker{Name: name, CanonicalName: canonical, Value: &v, Unit: strings.TrimSpace(m[3]), Status: domain.StatusUnknown, Confidence: 0.55, Warnings: []string{"Неизвестный показатель — проверьте название и значение."}}
 		if m[4] != "" {
 			a, _ := strconv.ParseFloat(strings.ReplaceAll(m[4], ",", "."), 64)
 			b, _ := strconv.ParseFloat(strings.ReplaceAll(m[5], ",", "."), 64)
@@ -244,13 +268,9 @@ func parseMarkers(text string) []domain.Marker {
 
 func parseKnownMarkers(text string) []domain.Marker {
 	found := map[string]domain.Marker{}
-	for _, rawLine := range strings.Split(text, "\n") {
-		line := strings.TrimSpace(rawLine)
+	for _, line := range markerSegments(text) {
 		lower := strings.ToLower(strings.ReplaceAll(line, "ё", "е"))
 		for _, spec := range markerSpecs {
-			if _, exists := found[spec.canonical]; exists {
-				continue
-			}
 			alias, index := matchedAlias(lower, spec.aliases)
 			if index < 0 {
 				continue
@@ -264,8 +284,13 @@ func parseKnownMarkers(text string) []domain.Marker {
 			if !ok {
 				continue
 			}
+			rawValue := value
 			value = normalizeMarkerValue(value, numbers[0], spec.maxPlausible)
-			marker := domain.Marker{Name: spec.name, CanonicalName: spec.canonical, Value: floatPtr(value), Unit: spec.unit, Status: domain.StatusUnknown}
+			marker := domain.Marker{Name: spec.name, CanonicalName: spec.canonical, Value: floatPtr(value), Unit: spec.unit, Status: domain.StatusUnknown, Confidence: 0.74}
+			if value != rawValue {
+				marker.Warnings = append(marker.Warnings, "OCR потерял десятичный разделитель результата.")
+				marker.Confidence = 0.62
+			}
 			prefix := lower[:index]
 			hint := domain.StatusUnknown
 			if strings.Contains(prefix, ">") {
@@ -277,15 +302,22 @@ func parseKnownMarkers(text string) []domain.Marker {
 				a, okA := parseOCRNumber(match[1])
 				b, okB := parseOCRNumber(match[2])
 				if okA && okB {
+					rawA, rawB := a, b
 					a, b = normalizeReferenceRange(value, a, b, hint)
 					marker.ReferenceMin, marker.ReferenceMax = floatPtr(a), floatPtr(b)
 					marker.ReferenceText = formatReference(a, b)
 					marker.Status = statusForRange(value, a, b)
+					marker.Confidence = maxFloat(marker.Confidence, 0.86)
+					if a != rawA || b != rawB {
+						marker.Warnings = append(marker.Warnings, "OCR потерял десятичный разделитель референса.")
+						marker.Confidence = minFloat(marker.Confidence, 0.76)
+					}
 				}
 			} else if match := thresholdToken.FindStringSubmatch(after); len(match) == 3 {
 				threshold, okThreshold := parseOCRNumber(match[2])
 				if okThreshold {
 					marker.ReferenceText = match[1] + " " + formatNumber(threshold)
+					marker.Confidence = maxFloat(marker.Confidence, 0.86)
 					switch match[1] {
 					case ">", ">=":
 						marker.ReferenceMin = floatPtr(threshold)
@@ -307,7 +339,33 @@ func parseKnownMarkers(text string) []domain.Marker {
 			if hint != domain.StatusUnknown {
 				marker.Status = hint
 			}
-			found[spec.canonical] = marker
+			if marker.Value != nil && marker.ReferenceMin != nil && marker.ReferenceMax != nil {
+				// A sparse OCR pass can mistake the first reference boundary for
+				// the result. Treat an exact boundary as uncertain instead of using
+				// it to overrule a clearer table-mode pass.
+				if *marker.Value == *marker.ReferenceMin || *marker.Value == *marker.ReferenceMax {
+					marker.Confidence = minFloat(marker.Confidence, 0.64)
+					marker.Warnings = appendUnique(marker.Warnings, "Результат совпал с границей референса — проверьте строку.")
+				}
+				// A missing decimal comma can also occur in the result column.
+				// Only repair an integer that is implausibly far beyond the same
+				// row's upper reference; ordinary high results remain untouched.
+				if !strings.ContainsAny(numbers[0], ",.") && *marker.ReferenceMax > 0 && *marker.Value > *marker.ReferenceMax*5 {
+					fixed := *marker.Value
+					for fixed > *marker.ReferenceMax*2 && fixed >= 10 {
+						fixed /= 10
+					}
+					if fixed != *marker.Value {
+						marker.Value = floatPtr(fixed)
+						marker.Status = statusForRange(fixed, *marker.ReferenceMin, *marker.ReferenceMax)
+						marker.Confidence = minFloat(marker.Confidence, 0.62)
+						marker.Warnings = appendUnique(marker.Warnings, "OCR потерял десятичный разделитель результата.")
+					}
+				}
+			}
+			if existing, exists := found[spec.canonical]; !exists || markerScore(marker) > markerScore(existing) {
+				found[spec.canonical] = marker
+			}
 		}
 	}
 	out := make([]domain.Marker, 0, len(found))
@@ -317,6 +375,170 @@ func parseKnownMarkers(text string) []domain.Marker {
 		}
 	}
 	return out
+}
+
+// PSM 11 often preserves values more accurately than table mode, but emits each
+// cell on a separate line. Synthetic segments join a marker heading with the
+// following cells until the next marker heading, allowing both layouts to use
+// the same strict parser without joining unrelated rows.
+func markerSegments(text string) []string {
+	raw := strings.Split(text, "\n")
+	lines := make([]string, 0, len(raw))
+	for _, line := range raw {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	segments := append([]string{}, lines...)
+	for i, line := range lines {
+		canonical := markerCanonicalInLine(line)
+		if canonical == "" {
+			continue
+		}
+		parts := []string{line}
+		for j := i + 1; j < len(lines) && j <= i+10; j++ {
+			nextCanonical := markerCanonicalInLine(lines[j])
+			if nextCanonical != "" && nextCanonical != canonical {
+				break
+			}
+			if nextCanonical == canonical {
+				// Many reports print a bold group heading followed by the actual
+				// result row. Restart at the result label so symbols from the
+				// heading (for example "(0" misread from "(K)") cannot become
+				// the measured value.
+				parts = []string{lines[j]}
+				continue
+			}
+			parts = append(parts, lines[j])
+		}
+		if len(parts) > 1 {
+			segments = append(segments, strings.Join(parts, " "))
+		}
+	}
+	return segments
+}
+
+func markerCanonicalInLine(line string) string {
+	lower := strings.ToLower(strings.ReplaceAll(line, "ё", "е"))
+	for _, spec := range markerSpecs {
+		if _, index := matchedAlias(lower, spec.aliases); index >= 0 {
+			return spec.canonical
+		}
+	}
+	return ""
+}
+
+func markerScore(marker domain.Marker) int {
+	score := 0
+	if marker.Value != nil {
+		score += 8
+	}
+	if marker.ReferenceMin != nil || marker.ReferenceMax != nil {
+		score += 5
+	}
+	if marker.Status != domain.StatusUnknown {
+		score += 3
+	}
+	if marker.Unit != "" {
+		score += 2
+	}
+	score += int(marker.Confidence * 10)
+	return score
+}
+
+func parseOCRCandidates(texts []string) []domain.Marker {
+	if len(texts) == 0 {
+		return []domain.Marker{}
+	}
+	byCanonical := map[string][]domain.Marker{}
+	order := []string{}
+	for _, text := range texts {
+		for _, marker := range parseMarkers(text) {
+			if _, exists := byCanonical[marker.CanonicalName]; !exists {
+				order = append(order, marker.CanonicalName)
+			}
+			byCanonical[marker.CanonicalName] = append(byCanonical[marker.CanonicalName], marker)
+		}
+	}
+	out := make([]domain.Marker, 0, len(order))
+	for _, canonical := range order {
+		candidates := byCanonical[canonical]
+		bestIndex, bestVotes, bestScore := 0, 0, -1
+		credibleCount := 0
+		for _, candidate := range candidates {
+			if candidate.Confidence >= 0.7 {
+				credibleCount++
+			}
+		}
+		for i, candidate := range candidates {
+			votes := 0
+			for _, other := range candidates {
+				if other.Confidence >= 0.7 && markerValuesAgree(candidate, other) {
+					votes++
+				}
+			}
+			score := votes*100 + markerScore(candidate)
+			if score > bestScore {
+				bestIndex, bestVotes, bestScore = i, votes, score
+			}
+		}
+		best := candidates[bestIndex]
+		for _, candidate := range candidates {
+			if markerValuesAgree(best, candidate) && markerScore(candidate) > markerScore(best) {
+				candidate.Warnings = appendUnique(candidate.Warnings, best.Warnings...)
+				best = candidate
+			}
+		}
+		if bestVotes >= 2 {
+			best.Confidence = maxFloat(best.Confidence, minFloat(0.98, 0.84+float64(bestVotes)*0.06))
+		}
+		if credibleCount > 1 && bestVotes < credibleCount {
+			best.Confidence = minFloat(best.Confidence, 0.58)
+			best.Warnings = appendUnique(best.Warnings, "Режимы OCR прочитали значение по-разному.")
+		}
+		out = append(out, best)
+	}
+	return out
+}
+
+func markerValuesAgree(a, b domain.Marker) bool {
+	if a.Value == nil || b.Value == nil {
+		return a.Value == nil && b.Value == nil
+	}
+	tolerance := maxFloat(0.011, maxFloat(absFloat(*a.Value), absFloat(*b.Value))*0.002)
+	return absFloat(*a.Value-*b.Value) <= tolerance
+}
+
+func appendUnique(values []string, additions ...string) []string {
+	seen := map[string]bool{}
+	for _, value := range values {
+		seen[value] = true
+	}
+	for _, value := range additions {
+		if value != "" && !seen[value] {
+			values, seen[value] = append(values, value), true
+		}
+	}
+	return values
+}
+
+func absFloat(v float64) float64 {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+func maxFloat(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func matchedAlias(line string, aliases []string) (string, int) {
@@ -356,19 +578,22 @@ func normalizeReferenceRange(value, rawMin, rawMax float64, hint domain.MarkerSt
 			if minValue > maxValue {
 				continue
 			}
-			valid := minValue <= value && value <= maxValue
-			if hint == domain.StatusHigh {
-				valid = minValue <= value && value > maxValue
-			} else if hint == domain.StatusLow {
-				valid = value < minValue && value <= maxValue
+			distance := 0.0
+			if value < minValue {
+				distance = (minValue - value) / maxFloat(absFloat(value), 1)
 			}
-			score := maxValue - minValue
-			if hint == domain.StatusHigh {
-				score += (value - maxValue) * 1000
-			} else if hint == domain.StatusLow {
-				score += (minValue - value) * 1000
+			if value > maxValue {
+				distance = (value - maxValue) / maxFloat(absFloat(value), 1)
 			}
-			if valid && score < bestScore {
+			if hint == domain.StatusHigh && value <= maxValue {
+				distance += 10
+			}
+			if hint == domain.StatusLow && value >= minValue {
+				distance += 10
+			}
+			width := (maxValue - minValue) / maxFloat(absFloat(value), 1)
+			score := distance*100 + width*0.01 + float64(minScale+maxScale)*0.02
+			if score < bestScore {
 				bestMin, bestMax, bestScore = minValue, maxValue, score
 			}
 		}
@@ -416,11 +641,82 @@ func isKnownMarkerLabel(name string) bool {
 
 func markersNeedReview(markers []domain.Marker) bool {
 	for _, marker := range markers {
-		if marker.Value == nil || marker.Status == domain.StatusUnknown || marker.Unit == "" {
+		if marker.Value == nil || marker.Status == domain.StatusUnknown || marker.Unit == "" || marker.Confidence < 0.7 {
 			return true
 		}
 	}
 	return false
+}
+
+func normalizeExternalMarkers(markers []domain.Marker) []domain.Marker {
+	out := make([]domain.Marker, 0, len(markers))
+	seen := map[string]bool{}
+	for _, marker := range markers {
+		var spec *markerSpec
+		for i := range markerSpecs {
+			if marker.CanonicalName == markerSpecs[i].canonical || isAliasFor(marker.Name, markerSpecs[i]) {
+				spec = &markerSpecs[i]
+				break
+			}
+		}
+		if spec == nil || marker.Value == nil || *marker.Value < 0 || *marker.Value > spec.maxPlausible || seen[spec.canonical] {
+			continue
+		}
+		seen[spec.canonical] = true
+		marker.Name, marker.CanonicalName, marker.Unit = spec.name, spec.canonical, spec.unit
+		marker.Confidence = 0.48
+		marker.Warnings = appendUnique(marker.Warnings, "Поле дополнено языковой моделью — обязательно сверьте с оригиналом.")
+		if marker.ReferenceMin != nil && marker.ReferenceMax != nil {
+			marker.Status = statusForRange(*marker.Value, *marker.ReferenceMin, *marker.ReferenceMax)
+		} else {
+			marker.Status = domain.StatusUnknown
+		}
+		out = append(out, marker)
+	}
+	return out
+}
+
+func isAliasFor(name string, spec markerSpec) bool {
+	lower := strings.ToLower(strings.ReplaceAll(name, "ё", "е"))
+	_, index := matchedAlias(lower, append(spec.aliases, strings.ToLower(spec.name)))
+	return index >= 0
+}
+
+func mergeMarkerSets(local, external []domain.Marker) []domain.Marker {
+	out := append([]domain.Marker{}, local...)
+	indices := map[string]int{}
+	for i, marker := range out {
+		indices[marker.CanonicalName] = i
+	}
+	for _, candidate := range external {
+		i, exists := indices[candidate.CanonicalName]
+		if !exists {
+			indices[candidate.CanonicalName] = len(out)
+			out = append(out, candidate)
+			continue
+		}
+		current := out[i]
+		if !markerValuesAgree(current, candidate) {
+			current.Confidence = minFloat(current.Confidence, 0.58)
+			current.Warnings = appendUnique(current.Warnings, "OCR и языковая модель предложили разные значения.")
+			out[i] = current
+			continue
+		}
+		if current.ReferenceMin == nil && candidate.ReferenceMin != nil {
+			current.ReferenceMin = candidate.ReferenceMin
+		}
+		if current.ReferenceMax == nil && candidate.ReferenceMax != nil {
+			current.ReferenceMax = candidate.ReferenceMax
+		}
+		if current.ReferenceText == "" {
+			current.ReferenceText = candidate.ReferenceText
+		}
+		if current.Status == domain.StatusUnknown && current.Value != nil && current.ReferenceMin != nil && current.ReferenceMax != nil {
+			current.Status = statusForRange(*current.Value, *current.ReferenceMin, *current.ReferenceMax)
+		}
+		out[i] = current
+	}
+	return out
 }
 func ruleReview(markers []domain.Marker) domain.AIReview {
 	abnormal := 0
