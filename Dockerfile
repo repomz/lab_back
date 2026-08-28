@@ -6,7 +6,7 @@ COPY . .
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/lab-api ./cmd/api
 
 FROM alpine:3.22
-RUN apk add --no-cache ca-certificates poppler-utils imagemagick imagemagick-jpeg imagemagick-heic imagemagick-tiff imagemagick-webp tesseract-ocr tesseract-ocr-data-eng tesseract-ocr-data-rus && addgroup -S lab && adduser -S -G lab -u 10001 lab
+RUN apk add --no-cache ca-certificates font-dejavu poppler-utils imagemagick imagemagick-jpeg imagemagick-heic imagemagick-tiff imagemagick-webp tesseract-ocr tesseract-ocr-data-eng tesseract-ocr-data-rus && addgroup -S lab && adduser -S -G lab -u 10001 lab
 WORKDIR /app
 COPY --from=build /out/lab-api /usr/local/bin/lab-api
 RUN mkdir -p /app/data/uploads && chown -R lab:lab /app/data

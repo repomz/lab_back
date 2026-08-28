@@ -49,6 +49,7 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Post("/api/v1/analyses", api.upload)
 		r.Get("/api/v1/analyses/{id}", api.analysis)
 		r.Get("/api/v1/analyses/{id}/file", api.file)
+		r.Get("/api/v1/analyses/{id}/report.pdf", api.reportPDF)
 		r.Delete("/api/v1/analyses/{id}", api.deleteAnalysis)
 		r.Post("/api/v1/analyses/{id}/reprocess", api.reprocess)
 		r.Post("/api/v1/analyses/{id}/share", api.share)
