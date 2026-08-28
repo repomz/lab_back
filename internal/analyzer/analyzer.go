@@ -343,7 +343,7 @@ func parseKnownMarkers(text string) []domain.Marker {
 				// A sparse OCR pass can mistake the first reference boundary for
 				// the result. Treat an exact boundary as uncertain instead of using
 				// it to overrule a clearer table-mode pass.
-				if *marker.Value == *marker.ReferenceMin || *marker.Value == *marker.ReferenceMax {
+				if !strings.ContainsAny(numbers[0], ",.") && (*marker.Value == *marker.ReferenceMin || *marker.Value == *marker.ReferenceMax) {
 					marker.Confidence = minFloat(marker.Confidence, 0.64)
 					marker.Warnings = appendUnique(marker.Warnings, "Результат совпал с границей референса — проверьте строку.")
 				}

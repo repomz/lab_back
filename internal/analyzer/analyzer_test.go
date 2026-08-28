@@ -156,6 +156,13 @@ func TestOCRGroupCodeIsNotUsedAsTriglycerideValue(t *testing.T) {
 	}
 }
 
+func TestExplicitDecimalZeroAtReferenceBoundaryRemainsCredible(t *testing.T) {
+	markers := parseOCRCandidates([]string{"СРБ 0,0 0-10 мг/л", "СРБ\n0,0\n0-10\nмг/л"})
+	if len(markers) != 1 || markers[0].Confidence < 0.9 || markers[0].Status != domain.StatusNormal {
+		t.Fatalf("unexpected CRP marker: %#v", markers)
+	}
+}
+
 func TestExternalModelCannotOverrideConflictingLocalValue(t *testing.T) {
 	value, wrong := 4.77, 47.7
 	local := []domain.Marker{{Name: "Глюкоза", CanonicalName: "glucose", Value: &value, Unit: "ммоль/л", Status: domain.StatusNormal, Confidence: 0.94}}
