@@ -49,6 +49,7 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Post("/api/v1/analyses", api.upload)
 		r.Get("/api/v1/analyses/{id}", api.analysis)
 		r.Get("/api/v1/analyses/{id}/file", api.file)
+		r.Delete("/api/v1/analyses/{id}", api.deleteAnalysis)
 		r.Post("/api/v1/analyses/{id}/reprocess", api.reprocess)
 		r.Post("/api/v1/analyses/{id}/share", api.share)
 		r.Get("/api/v1/consultations", api.consultations)
@@ -293,6 +294,49 @@ func (a *API) file(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", item.MimeType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", item.OriginalName))
 	http.ServeFile(w, r, item.StoragePath)
+}
+func (a *API) deleteAnalysis(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RolePatient {
+		write(w, 403, map[string]string{"error": "only patients can delete analyses"})
+		return
+	}
+	id, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		write(w, 400, map[string]string{"error": "invalid id"})
+		return
+	}
+	item, err := a.store.Analysis(r.Context(), id)
+	if err != nil || item.OwnerID != u.ID {
+		write(w, 404, map[string]string{"error": "analysis not found"})
+		return
+	}
+	storagePath := filepath.Clean(item.StoragePath)
+	uploadRoot := filepath.Clean(a.cfg.UploadDir)
+	if storagePath == uploadRoot || !strings.HasPrefix(storagePath, uploadRoot+string(os.PathSeparator)) {
+		write(w, 500, map[string]string{"error": "invalid storage path"})
+		return
+	}
+	trashPath := storagePath + ".deleting-" + id.Hex()
+	fileMoved := false
+	if err = os.Rename(storagePath, trashPath); err == nil {
+		fileMoved = true
+	} else if !os.IsNotExist(err) {
+		write(w, 500, map[string]string{"error": "could not remove original file"})
+		return
+	}
+	if err = a.store.DeleteAnalysis(r.Context(), id, u.ID); err != nil {
+		if fileMoved {
+			_ = os.Rename(trashPath, storagePath)
+		}
+		write(w, 500, map[string]string{"error": "could not delete analysis"})
+		return
+	}
+	if fileMoved {
+		_ = os.Remove(trashPath)
+	}
+	_ = os.Remove(filepath.Dir(storagePath)) // succeeds only when the owner directory is empty
+	w.WriteHeader(http.StatusNoContent)
 }
 func (a *API) reprocess(w http.ResponseWriter, r *http.Request) {
 	u := current(r)

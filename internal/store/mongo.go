@@ -100,6 +100,19 @@ func (s *Mongo) UpdateAnalysisRecognition(ctx context.Context, id, owner primiti
 	}
 	return err
 }
+func (s *Mongo) DeleteAnalysis(ctx context.Context, id, owner primitive.ObjectID) error {
+	r, err := s.db.Collection("analyses").DeleteOne(ctx, bson.M{"_id": id, "owner_id": owner})
+	if err != nil {
+		return err
+	}
+	if r.DeletedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	// Consultations cannot remain useful after their source analysis is gone.
+	// Cleanup is best-effort because the primary delete has already succeeded.
+	_, _ = s.db.Collection("consultations").DeleteMany(ctx, bson.M{"analysis_id": id})
+	return nil
+}
 func (s *Mongo) CreateConsultation(ctx context.Context, c *domain.Consultation) error {
 	c.ID = primitive.NewObjectID()
 	now := time.Now().UTC()

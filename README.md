@@ -19,6 +19,7 @@ DeepSeek используется только когда задан `DEEPSEEK_A
 - `GET /api/v1/me`, `GET /api/v1/doctors`
 - `POST /api/v1/analyses` (`multipart/form-data`), `GET /api/v1/analyses`
 - `GET /api/v1/analyses/{id}`, `GET /api/v1/analyses/{id}/file`
+- `DELETE /api/v1/analyses/{id}` — удаление записи и сохранённого оригинала владельцем
 - `POST /api/v1/analyses/{id}/reprocess` — повторное распознавание сохранённого оригинала
 - `POST /api/v1/analyses/{id}/share`
 - `GET/POST/PATCH /api/v1/consultations`
