@@ -17,10 +17,10 @@ func TestOfficialCatalogIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(items) < 100 {
+	if len(items) < 10 || len(items) > 500 {
 		t.Fatalf("catalog is unexpectedly small: %d", len(items))
 	}
-	if synced.IsZero() || items[0].Title == "" {
+	if synced.IsZero() || items[0].Title == "" || len(items[0].Specialties) == 0 || items[0].Category == "Дети" {
 		t.Fatal("catalog metadata was not parsed")
 	}
 	detail, err := New().Get(ctx, items[0].ID)

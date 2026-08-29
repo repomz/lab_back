@@ -84,6 +84,10 @@ func (s *Service) Sync(ctx context.Context) error {
 			ApplyStatusCalculated                             int
 			Mkbs                                              []struct{ MkbCode string }
 			Developers                                        []struct{ NkoShortName string }
+			Specialities                                      []struct {
+				ReferenceID   int    `json:"ReferenceId"`
+				ReferenceName string `json:"ReferenceName"`
+			}
 		}
 		TotalRecords int
 	}
@@ -96,6 +100,34 @@ func (s *Service) Sync(ctx context.Context) error {
 	items := make([]domain.Guide, 0, len(envelope.Data))
 	now := time.Now().UTC()
 	for _, v := range envelope.Data {
+		specialties := []string{}
+		for _, speciality := range v.Specialities {
+			if speciality.ReferenceID == 42 || speciality.ReferenceID == 93 {
+				specialties = append(specialties, speciality.ReferenceName)
+			}
+		}
+		cardiology := false
+		for _, m := range v.Mkbs {
+			if strings.HasPrefix(strings.ToUpper(m.MkbCode), "I") {
+				cardiology = true
+				break
+			}
+		}
+		therapeuticText := strings.ToLower(v.Name)
+		for _, d := range v.Developers {
+			therapeuticText += " " + strings.ToLower(d.NkoShortName)
+		}
+		therapy := strings.Contains(therapeuticText, "терапевт") || strings.Contains(therapeuticText, "внутренн") || strings.Contains(therapeuticText, "пневмони") || strings.Contains(therapeuticText, "бронхиальн") || strings.Contains(therapeuticText, "хроническая болезнь почек") || strings.Contains(therapeuticText, "сахарный диабет") || strings.Contains(therapeuticText, "железодефицит")
+		if cardiology {
+			specialties = append(specialties, "Кардиология")
+		}
+		if therapy {
+			specialties = append(specialties, "Терапия")
+		}
+		specialties = uniqueStrings(specialties)
+		if len(specialties) == 0 || v.AgeCategoryStr != "Взрослые" {
+			continue
+		}
 		codes := make([]string, 0, len(v.Mkbs))
 		for _, m := range v.Mkbs {
 			codes = append(codes, m.MkbCode)
@@ -111,13 +143,24 @@ func (s *Service) Sync(ctx context.Context) error {
 		} else if v.ApplyStatusCalculated == 3 {
 			status = "Применяется предыдущая редакция"
 		}
-		items = append(items, domain.Guide{ID: v.CodeVersion, Code: strings.Join(codes, ", "), Title: v.Name, Category: v.AgeCategoryStr, Status: status, Developers: devs, PublishedAt: published, SourceURL: "https://cr.minzdrav.gov.ru/preview-cr/" + v.CodeVersion, UpdatedAt: now})
+		items = append(items, domain.Guide{ID: v.CodeVersion, Code: strings.Join(codes, ", "), Title: v.Name, Category: v.AgeCategoryStr, Status: status, Developers: devs, Specialties: specialties, PublishedAt: published, SourceURL: "https://cr.minzdrav.gov.ru/preview-cr/" + v.CodeVersion, UpdatedAt: now})
 	}
 	s.mu.Lock()
 	s.items = items
 	s.synced = now
 	s.mu.Unlock()
 	return nil
+}
+func uniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != "" && !seen[value] {
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	return out
 }
 func cleanHTML(value string) string {
 	value = strings.ReplaceAll(value, "<br>", "\n")
@@ -163,6 +206,18 @@ func (s *Service) Get(ctx context.Context, id string) (domain.Guide, error) {
 		return domain.Guide{}, err
 	}
 	guide := domain.Guide{ID: id, Title: doc.Name, Code: doc.MKB, SourceURL: "https://cr.minzdrav.gov.ru/preview-cr/" + id, UpdatedAt: time.Now().UTC()}
+	s.mu.RLock()
+	for _, meta := range s.items {
+		if meta.ID == id {
+			guide.Category = meta.Category
+			guide.Status = meta.Status
+			guide.Developers = meta.Developers
+			guide.Specialties = meta.Specialties
+			guide.PublishedAt = meta.PublishedAt
+			break
+		}
+	}
+	s.mu.RUnlock()
 	for _, section := range doc.Obj.Sections {
 		text := cleanHTML(section.Content)
 		if text == "" && len(section.Data) > 0 {

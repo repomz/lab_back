@@ -49,6 +49,9 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Use(api.authorize)
 		r.Get("/api/v1/me", api.me)
 		r.Patch("/api/v1/me/patient-profile", api.updatePatientProfile)
+		r.Post("/api/v1/me/avatar", api.uploadAvatar)
+		r.Patch("/api/v1/me/avatar-preset", api.avatarPreset)
+		r.Get("/api/v1/users/{id}/avatar", api.avatar)
 		r.Get("/api/v1/doctors", api.doctors)
 		r.Get("/api/v1/patients", api.patients)
 		r.Get("/api/v1/analyses", api.analyses)
@@ -203,6 +206,110 @@ func (a *API) me(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, 200, u)
+}
+func (a *API) uploadAvatar(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	r.Body = http.MaxBytesReader(w, r.Body, 6<<20)
+	if e := r.ParseMultipartForm(6 << 20); e != nil {
+		write(w, 413, map[string]string{"error": "фото должно быть меньше 5 МБ"})
+		return
+	}
+	file, _, e := r.FormFile("file")
+	if e != nil {
+		write(w, 422, map[string]string{"error": "выберите фотографию"})
+		return
+	}
+	defer file.Close()
+	data, e := io.ReadAll(io.LimitReader(file, (5<<20)+1))
+	if e != nil || len(data) > 5<<20 {
+		write(w, 413, map[string]string{"error": "фото должно быть меньше 5 МБ"})
+		return
+	}
+	mime := http.DetectContentType(data)
+	ext := ""
+	switch mime {
+	case "image/jpeg":
+		ext = ".jpg"
+	case "image/png":
+		ext = ".png"
+	case "image/webp":
+		ext = ".webp"
+	default:
+		write(w, 415, map[string]string{"error": "поддерживаются JPG, PNG и WebP"})
+		return
+	}
+	dir := filepath.Join(a.cfg.UploadDir, "avatars")
+	if e = os.MkdirAll(dir, 0700); e != nil {
+		write(w, 500, map[string]string{"error": "storage unavailable"})
+		return
+	}
+	path := filepath.Join(dir, u.ID.Hex()+ext)
+	if e = os.WriteFile(path, data, 0600); e != nil {
+		write(w, 500, map[string]string{"error": "could not save avatar"})
+		return
+	}
+	previous, _ := a.store.UserByID(r.Context(), u.ID)
+	updated, e := a.store.UpdateAvatar(r.Context(), u.ID, path, "")
+	if e != nil {
+		_ = os.Remove(path)
+		write(w, 500, map[string]string{"error": "could not save avatar"})
+		return
+	}
+	if previous.AvatarPath != "" && previous.AvatarPath != path && strings.HasPrefix(previous.AvatarPath, dir+string(os.PathSeparator)) {
+		_ = os.Remove(previous.AvatarPath)
+	}
+	write(w, 200, updated)
+}
+func (a *API) avatarPreset(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RolePatient {
+		write(w, 403, map[string]string{"error": "для врача доступна только фотография"})
+		return
+	}
+	var in struct{ Preset string }
+	if decode(r, &in) != nil {
+		write(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	allowed := map[string]bool{"person": true, "leaf": true, "heart": true, "sun": true}
+	if !allowed[in.Preset] {
+		write(w, 422, map[string]string{"error": "unknown avatar"})
+		return
+	}
+	previous, _ := a.store.UserByID(r.Context(), u.ID)
+	updated, e := a.store.UpdateAvatar(r.Context(), u.ID, "", in.Preset)
+	if e != nil {
+		write(w, 500, map[string]string{"error": "could not save avatar"})
+		return
+	}
+	if previous.AvatarPath != "" {
+		_ = os.Remove(previous.AvatarPath)
+	}
+	write(w, 200, updated)
+}
+func (a *API) avatar(w http.ResponseWriter, r *http.Request) {
+	id, e := parseID(chi.URLParam(r, "id"))
+	if e != nil {
+		http.NotFound(w, r)
+		return
+	}
+	user, e := a.store.UserByID(r.Context(), id)
+	if e != nil || user.AvatarPath == "" {
+		http.NotFound(w, r)
+		return
+	}
+	file, e := os.Open(user.AvatarPath)
+	if e != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer file.Close()
+	info, e := file.Stat()
+	if e != nil {
+		http.NotFound(w, r)
+		return
+	}
+	http.ServeContent(w, r, "avatar"+filepath.Ext(user.AvatarPath), info.ModTime(), file)
 }
 func patientProfile(age int, heightCM, weightKG float64) (domain.PatientProfile, error) {
 	if age < 1 || age > 120 {
@@ -804,7 +911,7 @@ func (a *API) replaceSchedule(w http.ResponseWriter, r *http.Request) {
 	seen := map[int64]bool{}
 	for _, raw := range in.Starts {
 		v, e := time.Parse(time.RFC3339, raw)
-		if e != nil || v.Before(from) || !v.Before(to) || v.Minute()%30 != 0 {
+		if e != nil || v.Before(from) || !v.Before(to) || v.Before(time.Now().UTC()) || v.Minute()%30 != 0 {
 			write(w, 422, map[string]string{"error": "invalid slot"})
 			return
 		}

@@ -25,6 +25,9 @@ type User struct {
 	PatientProfile   *PatientProfile    `bson:"patient_profile,omitempty" json:"patient_profile,omitempty"`
 	HomeVisits       bool               `bson:"home_visits,omitempty" json:"home_visits,omitempty"`
 	AppointmentSlots []time.Time        `bson:"appointment_slots,omitempty" json:"appointment_slots,omitempty"`
+	AvatarPath       string             `bson:"avatar_path,omitempty" json:"-"`
+	AvatarPreset     string             `bson:"avatar_preset,omitempty" json:"avatar_preset,omitempty"`
+	AvatarUpdatedAt  *time.Time         `bson:"avatar_updated_at,omitempty" json:"avatar_updated_at,omitempty"`
 	CreatedAt        time.Time          `bson:"created_at" json:"created_at"`
 }
 
@@ -168,6 +171,7 @@ type Guide struct {
 	Category    string         `json:"category,omitempty"`
 	Status      string         `json:"status,omitempty"`
 	Developers  []string       `json:"developers,omitempty"`
+	Specialties []string       `json:"specialties,omitempty"`
 	PublishedAt time.Time      `json:"published_at,omitempty"`
 	SourceURL   string         `json:"source_url"`
 	Sections    []GuideSection `json:"sections,omitempty"`

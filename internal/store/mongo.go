@@ -58,6 +58,25 @@ func (s *Mongo) UpdatePatientProfile(ctx context.Context, id primitive.ObjectID,
 	err := r.Decode(&u)
 	return u, err
 }
+func (s *Mongo) UpdateAvatar(ctx context.Context, id primitive.ObjectID, path, preset string) (domain.User, error) {
+	now := time.Now().UTC()
+	set := bson.M{"avatar_updated_at": now}
+	unset := bson.M{}
+	if path != "" {
+		set["avatar_path"] = path
+		unset["avatar_preset"] = ""
+	} else {
+		set["avatar_preset"] = preset
+		unset["avatar_path"] = ""
+	}
+	update := bson.M{"$set": set}
+	if len(unset) > 0 {
+		update["$unset"] = unset
+	}
+	var user domain.User
+	err := s.db.Collection("users").FindOneAndUpdate(ctx, bson.M{"_id": id}, update, options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(bson.M{"password_hash": 0})).Decode(&user)
+	return user, err
+}
 func (s *Mongo) Doctors(ctx context.Context, specialty string) ([]domain.User, error) {
 	f := bson.M{"role": domain.RoleDoctor}
 	if specialty != "" {
