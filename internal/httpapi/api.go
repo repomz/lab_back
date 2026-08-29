@@ -18,6 +18,7 @@ import (
 	"github.com/repomz/lab_back/internal/auth"
 	"github.com/repomz/lab_back/internal/config"
 	"github.com/repomz/lab_back/internal/domain"
+	"github.com/repomz/lab_back/internal/guides"
 	"github.com/repomz/lab_back/internal/store"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -27,6 +28,7 @@ type API struct {
 	cfg      config.Config
 	store    *store.Mongo
 	analyzer *analyzer.Service
+	guides   *guides.Service
 }
 type actor struct {
 	ID   primitive.ObjectID
@@ -37,7 +39,7 @@ type contextKey string
 const actorKey contextKey = "actor"
 
 func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
-	api := &API{cfg, s, a}
+	api := &API{cfg: cfg, store: s, analyzer: a, guides: guides.New()}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, api.cors)
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ok"}) })
@@ -63,6 +65,19 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Patch("/api/v1/consultations/{id}", api.reply)
 		r.Post("/api/v1/recommendations/{kind}", api.recommendation)
 		r.Post("/api/v1/clinical-assist", api.clinicalAssist)
+		r.Get("/api/v1/doctors/{id}/schedule", api.schedule)
+		r.Put("/api/v1/doctor/schedule", api.replaceSchedule)
+		r.Get("/api/v1/patients/{id}/notes", api.patientNotes)
+		r.Post("/api/v1/patients/{id}/notes", api.createPatientNote)
+		r.Get("/api/v1/ai/chats", api.aiChats)
+		r.Post("/api/v1/ai/chats", api.createAIChat)
+		r.Get("/api/v1/ai/chats/{id}", api.aiChat)
+		r.Patch("/api/v1/ai/chats/{id}", api.renameAIChat)
+		r.Delete("/api/v1/ai/chats/{id}", api.deleteAIChat)
+		r.Post("/api/v1/ai/chats/{id}/messages", api.aiMessage)
+		r.Get("/api/v1/guides", api.guideList)
+		r.Get("/api/v1/guides/{id}", api.guideDetail)
+		r.Post("/api/v1/guides/sync", api.syncGuides)
 	})
 	return r
 }
@@ -541,25 +556,35 @@ func (a *API) createConsultation(w http.ResponseWriter, r *http.Request) {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	aid, e1 := parseID(in.AnalysisID)
 	did, e2 := parseID(in.DoctorID)
-	if e1 != nil || e2 != nil {
-		write(w, 422, map[string]string{"error": "invalid analysis or doctor id"})
+	if e2 != nil {
+		write(w, 422, map[string]string{"error": "invalid doctor id"})
 		return
 	}
-	item, e := a.store.Analysis(r.Context(), aid)
-	if e != nil || item.OwnerID != u.ID {
-		write(w, 404, map[string]string{"error": "analysis not found"})
-		return
+	var aid primitive.ObjectID
+	if strings.TrimSpace(in.AnalysisID) != "" {
+		var parseErr error
+		aid, parseErr = parseID(in.AnalysisID)
+		if parseErr != nil {
+			write(w, 422, map[string]string{"error": "invalid analysis id"})
+			return
+		}
+		item, lookupErr := a.store.Analysis(r.Context(), aid)
+		if lookupErr != nil || item.OwnerID != u.ID {
+			write(w, 404, map[string]string{"error": "analysis not found"})
+			return
+		}
 	}
 	doctor, e := a.store.UserByID(r.Context(), did)
 	if e != nil || doctor.Role != domain.RoleDoctor {
 		write(w, 404, map[string]string{"error": "doctor not found"})
 		return
 	}
-	if e = a.store.Share(r.Context(), aid, u.ID, did); e != nil {
-		write(w, 500, map[string]string{"error": "could not grant access"})
-		return
+	if !aid.IsZero() {
+		if e = a.store.Share(r.Context(), aid, u.ID, did); e != nil {
+			write(w, 500, map[string]string{"error": "could not grant access"})
+			return
+		}
 	}
 	serviceType := strings.TrimSpace(in.ServiceType)
 	if serviceType == "" {
@@ -585,8 +610,21 @@ func (a *API) createConsultation(w http.ResponseWriter, r *http.Request) {
 		}
 		appointmentAt = &parsed
 	}
-	c := domain.Consultation{AnalysisID: aid, PatientID: u.ID, DoctorID: did, Source: "doctor", Title: title, Specialty: doctor.Specialization, ServiceType: serviceType, AppointmentAt: appointmentAt, Question: strings.TrimSpace(in.Question)}
+	if serviceType == "appointment" && appointmentAt == nil {
+		write(w, 422, map[string]string{"error": "выберите время приёма"})
+		return
+	}
+	c := domain.Consultation{ID: primitive.NewObjectID(), AnalysisID: aid, PatientID: u.ID, DoctorID: did, Source: "doctor", Title: title, Specialty: doctor.Specialization, ServiceType: serviceType, AppointmentAt: appointmentAt, Question: strings.TrimSpace(in.Question)}
+	if serviceType == "appointment" {
+		if e = a.store.ReserveSlot(r.Context(), did, u.ID, c.ID, appointmentAt.UTC()); e != nil {
+			write(w, 409, map[string]string{"error": "это время уже занято; выберите другое"})
+			return
+		}
+	}
 	if e = a.store.CreateConsultation(r.Context(), &c); e != nil {
+		if serviceType == "appointment" {
+			a.store.ReleaseSlot(r.Context(), c.ID)
+		}
 		write(w, 500, map[string]string{"error": "could not request consultation"})
 		return
 	}
@@ -697,4 +735,289 @@ func (a *API) reply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	write(w, 200, map[string]string{"status": in.Status})
+}
+
+func dateRange(r *http.Request) (time.Time, time.Time, error) {
+	from, err := time.Parse(time.RFC3339, r.URL.Query().Get("from"))
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	to, err := time.Parse(time.RFC3339, r.URL.Query().Get("to"))
+	if err != nil || !to.After(from) || to.Sub(from) > 32*24*time.Hour {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid date range")
+	}
+	return from.UTC(), to.UTC(), nil
+}
+func (a *API) schedule(w http.ResponseWriter, r *http.Request) {
+	doctor, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		write(w, 400, map[string]string{"error": "invalid doctor id"})
+		return
+	}
+	from, to, err := dateRange(r)
+	if err != nil {
+		write(w, 422, map[string]string{"error": "invalid date range"})
+		return
+	}
+	items, err := a.store.Schedule(r.Context(), doctor, from, to)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "could not load schedule"})
+		return
+	}
+	if current(r).Role != domain.RoleDoctor || current(r).ID != doctor {
+		for i := range items {
+			items[i].PatientID = primitive.NilObjectID
+			items[i].AppointmentID = primitive.NilObjectID
+			items[i].PatientName = ""
+		}
+	}
+	if items == nil {
+		items = []domain.ScheduleSlot{}
+	}
+	write(w, 200, items)
+}
+func (a *API) replaceSchedule(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can edit schedule"})
+		return
+	}
+	var in struct {
+		From, To string
+		Starts   []string
+	}
+	if decode(r, &in) != nil {
+		write(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	from, err := time.Parse(time.RFC3339, in.From)
+	if err != nil {
+		write(w, 422, map[string]string{"error": "invalid from"})
+		return
+	}
+	to, err := time.Parse(time.RFC3339, in.To)
+	if err != nil || !to.After(from) || to.Sub(from) > 8*24*time.Hour {
+		write(w, 422, map[string]string{"error": "invalid week range"})
+		return
+	}
+	starts := make([]time.Time, 0, len(in.Starts))
+	seen := map[int64]bool{}
+	for _, raw := range in.Starts {
+		v, e := time.Parse(time.RFC3339, raw)
+		if e != nil || v.Before(from) || !v.Before(to) || v.Minute()%30 != 0 {
+			write(w, 422, map[string]string{"error": "invalid slot"})
+			return
+		}
+		if !seen[v.Unix()] {
+			seen[v.Unix()] = true
+			starts = append(starts, v.UTC())
+		}
+	}
+	if err = a.store.ReplaceSchedule(r.Context(), u.ID, from.UTC(), to.UTC(), starts); err != nil {
+		write(w, 500, map[string]string{"error": "could not save schedule"})
+		return
+	}
+	write(w, 200, map[string]string{"status": "saved"})
+}
+func (a *API) patientNotes(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can view notes"})
+		return
+	}
+	pid, e := parseID(chi.URLParam(r, "id"))
+	if e != nil || !a.store.PatientAccessible(r.Context(), u.ID, pid) {
+		write(w, 403, map[string]string{"error": "patient is not available"})
+		return
+	}
+	items, e := a.store.PatientNotes(r.Context(), u.ID, pid)
+	if e != nil {
+		write(w, 500, map[string]string{"error": "could not load notes"})
+		return
+	}
+	if items == nil {
+		items = []domain.PatientNote{}
+	}
+	write(w, 200, items)
+}
+func (a *API) createPatientNote(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can add notes"})
+		return
+	}
+	pid, e := parseID(chi.URLParam(r, "id"))
+	if e != nil || !a.store.PatientAccessible(r.Context(), u.ID, pid) {
+		write(w, 403, map[string]string{"error": "patient is not available"})
+		return
+	}
+	var in struct{ Text string }
+	if decode(r, &in) != nil || strings.TrimSpace(in.Text) == "" {
+		write(w, 422, map[string]string{"error": "заключение не может быть пустым"})
+		return
+	}
+	if len([]rune(in.Text)) > 12000 {
+		write(w, 422, map[string]string{"error": "заключение слишком длинное"})
+		return
+	}
+	note := domain.PatientNote{DoctorID: u.ID, PatientID: pid, Text: strings.TrimSpace(in.Text)}
+	if e = a.store.CreatePatientNote(r.Context(), &note); e != nil {
+		write(w, 500, map[string]string{"error": "could not save note"})
+		return
+	}
+	write(w, 201, note)
+}
+func (a *API) requireDoctor(w http.ResponseWriter, r *http.Request) (actor, bool) {
+	u := current(r)
+	if u.Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can use AI workspace"})
+		return u, false
+	}
+	return u, true
+}
+func (a *API) aiChats(w http.ResponseWriter, r *http.Request) {
+	u, ok := a.requireDoctor(w, r)
+	if !ok {
+		return
+	}
+	items, e := a.store.AIChats(r.Context(), u.ID)
+	if e != nil {
+		write(w, 500, map[string]string{"error": "could not load chats"})
+		return
+	}
+	if items == nil {
+		items = []domain.AIChat{}
+	}
+	write(w, 200, items)
+}
+func (a *API) createAIChat(w http.ResponseWriter, r *http.Request) {
+	u, ok := a.requireDoctor(w, r)
+	if !ok {
+		return
+	}
+	var in struct{ Title string }
+	_ = decode(r, &in)
+	title := strings.TrimSpace(in.Title)
+	if title == "" {
+		title = "Консультация · " + time.Now().Format("02.01.2006 15:04")
+	}
+	chat := domain.AIChat{DoctorID: u.ID, Title: title}
+	if e := a.store.CreateAIChat(r.Context(), &chat); e != nil {
+		write(w, 500, map[string]string{"error": "could not create chat"})
+		return
+	}
+	write(w, 201, chat)
+}
+func (a *API) aiChat(w http.ResponseWriter, r *http.Request) {
+	u, ok := a.requireDoctor(w, r)
+	if !ok {
+		return
+	}
+	id, e := parseID(chi.URLParam(r, "id"))
+	if e != nil {
+		write(w, 400, map[string]string{"error": "invalid chat id"})
+		return
+	}
+	chat, e := a.store.AIChat(r.Context(), id, u.ID)
+	if e != nil {
+		write(w, 404, map[string]string{"error": "chat not found"})
+		return
+	}
+	write(w, 200, chat)
+}
+func (a *API) renameAIChat(w http.ResponseWriter, r *http.Request) {
+	u, ok := a.requireDoctor(w, r)
+	if !ok {
+		return
+	}
+	id, e := parseID(chi.URLParam(r, "id"))
+	var in struct{ Title string }
+	if e != nil || decode(r, &in) != nil || strings.TrimSpace(in.Title) == "" {
+		write(w, 422, map[string]string{"error": "invalid title"})
+		return
+	}
+	if e = a.store.RenameAIChat(r.Context(), id, u.ID, strings.TrimSpace(in.Title)); e != nil {
+		write(w, 404, map[string]string{"error": "chat not found"})
+		return
+	}
+	write(w, 200, map[string]string{"status": "saved"})
+}
+func (a *API) deleteAIChat(w http.ResponseWriter, r *http.Request) {
+	u, ok := a.requireDoctor(w, r)
+	if !ok {
+		return
+	}
+	id, e := parseID(chi.URLParam(r, "id"))
+	if e != nil || a.store.DeleteAIChat(r.Context(), id, u.ID) != nil {
+		write(w, 404, map[string]string{"error": "chat not found"})
+		return
+	}
+	w.WriteHeader(204)
+}
+func (a *API) aiMessage(w http.ResponseWriter, r *http.Request) {
+	u, ok := a.requireDoctor(w, r)
+	if !ok {
+		return
+	}
+	id, e := parseID(chi.URLParam(r, "id"))
+	var in struct{ Content string }
+	if e != nil || decode(r, &in) != nil || strings.TrimSpace(in.Content) == "" {
+		write(w, 422, map[string]string{"error": "message is required"})
+		return
+	}
+	chat, e := a.store.AIChat(r.Context(), id, u.ID)
+	if e != nil {
+		write(w, 404, map[string]string{"error": "chat not found"})
+		return
+	}
+	now := time.Now().UTC()
+	userMessage := domain.AIMessage{Role: "user", Content: strings.TrimSpace(in.Content), CreatedAt: now}
+	history := append(chat.Messages, userMessage)
+	reply, e := a.analyzer.DoctorChat(r.Context(), history)
+	if e != nil {
+		write(w, 503, map[string]string{"error": "AI temporarily unavailable"})
+		return
+	}
+	assistant := domain.AIMessage{Role: "assistant", Content: reply, CreatedAt: time.Now().UTC()}
+	if e = a.store.AppendAIChat(r.Context(), id, u.ID, userMessage, assistant); e != nil {
+		write(w, 500, map[string]string{"error": "could not save messages"})
+		return
+	}
+	write(w, 201, assistant)
+}
+func (a *API) guideList(w http.ResponseWriter, r *http.Request) {
+	if current(r).Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can view guides"})
+		return
+	}
+	items, synced, e := a.guides.List(r.Context())
+	if e != nil {
+		write(w, 503, map[string]string{"error": "official catalog is temporarily unavailable"})
+		return
+	}
+	write(w, 200, map[string]any{"items": items, "synced_at": synced, "source": "Минздрав России"})
+}
+func (a *API) guideDetail(w http.ResponseWriter, r *http.Request) {
+	if current(r).Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can view guides"})
+		return
+	}
+	item, e := a.guides.Get(r.Context(), chi.URLParam(r, "id"))
+	if e != nil {
+		write(w, 502, map[string]string{"error": "could not load the official guide"})
+		return
+	}
+	write(w, 200, item)
+}
+func (a *API) syncGuides(w http.ResponseWriter, r *http.Request) {
+	if current(r).Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can sync guides"})
+		return
+	}
+	if e := a.guides.Sync(r.Context()); e != nil {
+		write(w, 503, map[string]string{"error": "official catalog is temporarily unavailable"})
+		return
+	}
+	items, synced, _ := a.guides.List(r.Context())
+	write(w, 200, map[string]any{"items": items, "synced_at": synced, "source": "Минздрав России"})
 }

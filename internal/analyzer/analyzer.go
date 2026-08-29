@@ -917,6 +917,28 @@ func (s *Service) ClinicalAssist(ctx context.Context, patient domain.User, objec
 	return out, err
 }
 
+func (s *Service) DoctorChat(ctx context.Context, messages []domain.AIMessage) (string, error) {
+	if s.cfg.DeepSeekAPIKey == "" {
+		return "", fmt.Errorf("ai service is not configured")
+	}
+	if len(messages) > 20 {
+		messages = messages[len(messages)-20:]
+	}
+	conversation, _ := json.Marshal(messages)
+	var out struct {
+		Reply string `json:"reply"`
+	}
+	system := "Ты — AI-помощник врача для клинического рассуждения. Отвечай по-русски, структурированно и кратко. Не выдумывай данные пациента, исследования, ссылки или актуальность рекомендаций. Явно отделяй факты от гипотез, отмечай красные флаги и недостающие данные. Не заменяй решение врача и не назначай конкретные препараты или дозировки. Если ссылаешься на руководство, проси сверить действующую редакцию в официальном источнике. Верни JSON с полем reply."
+	err := s.completeJSON(ctx, system, "История диалога: "+string(conversation), &out)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(out.Reply) == "" {
+		return "", fmt.Errorf("empty ai reply")
+	}
+	return strings.TrimSpace(out.Reply), nil
+}
+
 func compactAnalysisContext(analyses []domain.Analysis) string {
 	if len(analyses) == 0 {
 		return "нет данных"

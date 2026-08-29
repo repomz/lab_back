@@ -24,6 +24,10 @@ func Connect(ctx context.Context, uri, database string) (*Mongo, error) {
 	}
 	s := &Mongo{db: c.Database(database)}
 	_, err = s.db.Collection("users").Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)})
+	if err != nil {
+		return nil, err
+	}
+	_, err = s.db.Collection("schedule_slots").Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "doctor_id", Value: 1}, {Key: "start_at", Value: 1}}, Options: options.Index().SetUnique(true)})
 	return s, err
 }
 func (s *Mongo) CreateUser(ctx context.Context, u *domain.User) error {
@@ -126,7 +130,9 @@ func (s *Mongo) DeleteAnalysis(ctx context.Context, id, owner primitive.ObjectID
 	return nil
 }
 func (s *Mongo) CreateConsultation(ctx context.Context, c *domain.Consultation) error {
-	c.ID = primitive.NewObjectID()
+	if c.ID.IsZero() {
+		c.ID = primitive.NewObjectID()
+	}
 	now := time.Now().UTC()
 	c.CreatedAt = now
 	c.UpdatedAt = now
@@ -187,6 +193,122 @@ func (s *Mongo) Consultations(ctx context.Context, user primitive.ObjectID, role
 func (s *Mongo) Reply(ctx context.Context, id, doctor primitive.ObjectID, reply, status string) error {
 	r, err := s.db.Collection("consultations").UpdateOne(ctx, bson.M{"_id": id, "doctor_id": doctor}, bson.M{"$set": bson.M{"reply": reply, "status": status, "updated_at": time.Now().UTC()}})
 	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+
+func (s *Mongo) Schedule(ctx context.Context, doctor primitive.ObjectID, from, to time.Time) ([]domain.ScheduleSlot, error) {
+	cur, err := s.db.Collection("schedule_slots").Find(ctx, bson.M{"doctor_id": doctor, "start_at": bson.M{"$gte": from, "$lt": to}}, options.Find().SetSort(bson.D{{Key: "start_at", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []domain.ScheduleSlot
+	if err = cur.All(ctx, &out); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if !out[i].PatientID.IsZero() {
+			if patient, e := s.UserByID(ctx, out[i].PatientID); e == nil {
+				out[i].PatientName = patient.FullName
+			}
+		}
+	}
+	return out, nil
+}
+
+func (s *Mongo) ReplaceSchedule(ctx context.Context, doctor primitive.ObjectID, from, to time.Time, starts []time.Time) error {
+	collection := s.db.Collection("schedule_slots")
+	_, err := collection.DeleteMany(ctx, bson.M{"doctor_id": doctor, "start_at": bson.M{"$gte": from, "$lt": to}, "status": "available"})
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, start := range starts {
+		_, err = collection.UpdateOne(ctx, bson.M{"doctor_id": doctor, "start_at": start, "status": bson.M{"$ne": "booked"}}, bson.M{"$set": bson.M{"end_at": start.Add(30 * time.Minute), "status": "available", "updated_at": now}, "$setOnInsert": bson.M{"_id": primitive.NewObjectID(), "doctor_id": doctor}}, options.Update().SetUpsert(true))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Mongo) ReserveSlot(ctx context.Context, doctor, patient, appointment primitive.ObjectID, start time.Time) error {
+	now := time.Now().UTC()
+	r := s.db.Collection("schedule_slots").FindOneAndUpdate(ctx, bson.M{"doctor_id": doctor, "start_at": start, "status": "available"}, bson.M{"$set": bson.M{"status": "booked", "patient_id": patient, "appointment_id": appointment, "updated_at": now}})
+	return r.Err()
+}
+
+func (s *Mongo) ReleaseSlot(ctx context.Context, appointment primitive.ObjectID) {
+	_, _ = s.db.Collection("schedule_slots").UpdateOne(ctx, bson.M{"appointment_id": appointment}, bson.M{"$set": bson.M{"status": "available", "updated_at": time.Now().UTC()}, "$unset": bson.M{"patient_id": "", "appointment_id": ""}})
+}
+
+func (s *Mongo) PatientAccessible(ctx context.Context, doctor, patient primitive.ObjectID) bool {
+	err := s.db.Collection("consultations").FindOne(ctx, bson.M{"doctor_id": doctor, "patient_id": patient}).Err()
+	return err == nil
+}
+
+func (s *Mongo) PatientNotes(ctx context.Context, doctor, patient primitive.ObjectID) ([]domain.PatientNote, error) {
+	cur, err := s.db.Collection("patient_notes").Find(ctx, bson.M{"doctor_id": doctor, "patient_id": patient}, options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []domain.PatientNote
+	err = cur.All(ctx, &out)
+	return out, err
+}
+func (s *Mongo) CreatePatientNote(ctx context.Context, note *domain.PatientNote) error {
+	now := time.Now().UTC()
+	note.ID = primitive.NewObjectID()
+	note.CreatedAt = now
+	note.UpdatedAt = now
+	_, err := s.db.Collection("patient_notes").InsertOne(ctx, note)
+	return err
+}
+
+func (s *Mongo) AIChats(ctx context.Context, doctor primitive.ObjectID) ([]domain.AIChat, error) {
+	cur, err := s.db.Collection("ai_chats").Find(ctx, bson.M{"doctor_id": doctor}, options.Find().SetSort(bson.D{{Key: "updated_at", Value: -1}}).SetProjection(bson.M{"messages": bson.M{"$slice": -1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []domain.AIChat
+	err = cur.All(ctx, &out)
+	return out, err
+}
+func (s *Mongo) CreateAIChat(ctx context.Context, chat *domain.AIChat) error {
+	now := time.Now().UTC()
+	chat.ID = primitive.NewObjectID()
+	chat.CreatedAt = now
+	chat.UpdatedAt = now
+	chat.Messages = []domain.AIMessage{}
+	_, err := s.db.Collection("ai_chats").InsertOne(ctx, chat)
+	return err
+}
+func (s *Mongo) AIChat(ctx context.Context, id, doctor primitive.ObjectID) (domain.AIChat, error) {
+	var out domain.AIChat
+	err := s.db.Collection("ai_chats").FindOne(ctx, bson.M{"_id": id, "doctor_id": doctor}).Decode(&out)
+	return out, err
+}
+func (s *Mongo) RenameAIChat(ctx context.Context, id, doctor primitive.ObjectID, title string) error {
+	r, err := s.db.Collection("ai_chats").UpdateOne(ctx, bson.M{"_id": id, "doctor_id": doctor}, bson.M{"$set": bson.M{"title": title, "updated_at": time.Now().UTC()}})
+	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+func (s *Mongo) AppendAIChat(ctx context.Context, id, doctor primitive.ObjectID, messages ...domain.AIMessage) error {
+	r, err := s.db.Collection("ai_chats").UpdateOne(ctx, bson.M{"_id": id, "doctor_id": doctor}, bson.M{"$push": bson.M{"messages": bson.M{"$each": messages}}, "$set": bson.M{"updated_at": time.Now().UTC()}})
+	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+func (s *Mongo) DeleteAIChat(ctx context.Context, id, doctor primitive.ObjectID) error {
+	r, err := s.db.Collection("ai_chats").DeleteOne(ctx, bson.M{"_id": id, "doctor_id": doctor})
+	if err == nil && r.DeletedCount == 0 {
 		return mongo.ErrNoDocuments
 	}
 	return err

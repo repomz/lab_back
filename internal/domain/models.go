@@ -124,3 +124,58 @@ type Consultation struct {
 	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
 	UpdatedAt     time.Time          `bson:"updated_at" json:"updated_at"`
 }
+
+type ScheduleSlot struct {
+	ID            primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	DoctorID      primitive.ObjectID `bson:"doctor_id" json:"doctor_id"`
+	PatientID     primitive.ObjectID `bson:"patient_id,omitempty" json:"patient_id,omitempty"`
+	AppointmentID primitive.ObjectID `bson:"appointment_id,omitempty" json:"appointment_id,omitempty"`
+	StartAt       time.Time          `bson:"start_at" json:"start_at"`
+	EndAt         time.Time          `bson:"end_at" json:"end_at"`
+	Status        string             `bson:"status" json:"status"`
+	PatientName   string             `bson:"-" json:"patient_name,omitempty"`
+	UpdatedAt     time.Time          `bson:"updated_at" json:"updated_at"`
+}
+
+type PatientNote struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	DoctorID  primitive.ObjectID `bson:"doctor_id" json:"doctor_id"`
+	PatientID primitive.ObjectID `bson:"patient_id" json:"patient_id"`
+	Text      string             `bson:"text" json:"text"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+	UpdatedAt time.Time          `bson:"updated_at" json:"updated_at"`
+}
+
+type AIMessage struct {
+	Role      string    `bson:"role" json:"role"`
+	Content   string    `bson:"content" json:"content"`
+	CreatedAt time.Time `bson:"created_at" json:"created_at"`
+}
+
+type AIChat struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	DoctorID  primitive.ObjectID `bson:"doctor_id" json:"doctor_id"`
+	Title     string             `bson:"title" json:"title"`
+	Messages  []AIMessage        `bson:"messages" json:"messages"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+	UpdatedAt time.Time          `bson:"updated_at" json:"updated_at"`
+}
+
+type Guide struct {
+	ID          string         `json:"id"`
+	Code        string         `json:"code,omitempty"`
+	Title       string         `json:"title"`
+	Category    string         `json:"category,omitempty"`
+	Status      string         `json:"status,omitempty"`
+	Developers  []string       `json:"developers,omitempty"`
+	PublishedAt time.Time      `json:"published_at,omitempty"`
+	SourceURL   string         `json:"source_url"`
+	Sections    []GuideSection `json:"sections,omitempty"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+}
+
+type GuideSection struct {
+	ID      string `json:"id"`
+	Title   string `json:"title"`
+	Content string `json:"content"`
+}
