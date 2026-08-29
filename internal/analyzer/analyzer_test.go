@@ -175,3 +175,17 @@ func TestExternalModelCannotOverrideConflictingLocalValue(t *testing.T) {
 		t.Fatal("a disagreement must lower confidence")
 	}
 }
+
+func TestClassifyAnalysisFromRecognizedMarkers(t *testing.T) {
+	biochemistry := []domain.Marker{{CanonicalName: "glucose"}, {CanonicalName: "creatinine"}, {CanonicalName: "alt"}}
+	if got := ClassifyAnalysis(biochemistry, "Сыворотка крови"); got != "Кровь · биохимия" {
+		t.Fatalf("biochemistry classified as %q", got)
+	}
+	cbc := []domain.Marker{{CanonicalName: "hemoglobin"}, {CanonicalName: "leukocytes"}, {CanonicalName: "platelets"}}
+	if got := ClassifyAnalysis(cbc, "Общий анализ крови"); got != "Кровь · ОАК" {
+		t.Fatalf("CBC classified as %q", got)
+	}
+	if got := ClassifyAnalysis(nil, "Общий анализ мочи лейкоциты эритроциты удельный вес"); got != "Моча · ОАМ" {
+		t.Fatalf("urinalysis classified as %q", got)
+	}
+}

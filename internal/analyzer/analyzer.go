@@ -29,6 +29,10 @@ func New(cfg config.Config) *Service {
 }
 
 func (s *Service) Process(ctx context.Context, path, mime string) (string, []domain.Marker, domain.AIReview, string) {
+	return s.ProcessForPatient(ctx, path, mime, nil)
+}
+
+func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, profile *domain.PatientProfile) (string, []domain.Marker, domain.AIReview, string) {
 	text, candidates, err := s.extract(ctx, path, mime)
 	if err != nil {
 		return "", []domain.Marker{}, failedReview(), "failed"
@@ -36,14 +40,19 @@ func (s *Service) Process(ctx context.Context, path, mime string) (string, []dom
 	markers := parseOCRCandidates(candidates)
 	review := ruleReview(markers)
 	if s.cfg.DeepSeekAPIKey != "" && strings.TrimSpace(text) != "" {
-		if m, r, e := s.deepSeek(ctx, text); e != nil {
+		if m, r, e := s.deepSeek(ctx, text, profile); e != nil {
 			log.Printf("deepseek structuring failed: %v", e)
 		} else if len(m) > 0 {
 			// An external language model may fill gaps, but it must never replace a
 			// stronger value that was read consistently by local OCR passes.
 			markers = mergeMarkerSets(markers, normalizeExternalMarkers(m))
-			review = ruleReview(markers)
-			review.Provider = r.Provider
+			fallback := ruleReview(markers)
+			if strings.TrimSpace(r.Summary) == "" {
+				r = fallback
+			}
+			r.Provider = "deepseek"
+			r.Disclaimer = fallback.Disclaimer
+			review = r
 		} else {
 			log.Printf("deepseek structuring returned no markers")
 		}
@@ -57,6 +66,52 @@ func (s *Service) Process(ctx context.Context, path, mime string) (string, []dom
 		review.Summary += " Часть полей распознана неуверенно — сверьте их с оригиналом."
 	}
 	return text, markers, review, status
+}
+
+func ClassifyAnalysis(markers []domain.Marker, text string) string {
+	lower := strings.ToLower(text)
+	hasAny := func(words ...string) bool {
+		for _, word := range words {
+			if strings.Contains(lower, word) {
+				return true
+			}
+		}
+		return false
+	}
+	cbcMarkers, hormoneMarkers, urineMarkers := 0, 0, 0
+	for _, marker := range markers {
+		switch strings.ToLower(marker.CanonicalName) {
+		case "hemoglobin", "erythrocytes", "leukocytes", "platelets", "hematocrit", "mcv", "mch", "mchc", "esr":
+			cbcMarkers++
+		case "tsh", "free_t4", "free_t3", "cortisol", "prolactin", "testosterone", "estradiol", "insulin":
+			hormoneMarkers++
+		case "urine_protein", "urine_glucose", "urine_leukocytes", "urine_erythrocytes", "urine_ph", "specific_gravity":
+			urineMarkers++
+		}
+	}
+	if urineMarkers >= 2 || hasAny("общий анализ моч", "удельный вес", "плоский эпител", "лейкоциты в моч", "цвет моч") {
+		if hasAny("микроальбумин", "суточная моч", "белок в моч", "креатинин моч") {
+			return "Моча · биохимия"
+		}
+		return "Моча · ОАМ"
+	}
+	if cbcMarkers >= 2 || hasAny("гемоглобин", "эритроцит", "лейкоцит", "тромбоцит", "гематокрит", "соэ") {
+		return "Кровь · ОАК"
+	}
+	if hormoneMarkers >= 2 || hasAny("ттг", "тиреотроп", "т4 свобод", "т3 свобод", "кортизол", "пролактин", "тестостерон", "эстрадиол", "инсулин") {
+		return "Кровь · гормоны"
+	}
+	biochemistry := 0
+	for _, marker := range markers {
+		switch marker.CanonicalName {
+		case "glucose", "albumin", "bilirubin_total", "bilirubin_direct", "alt", "ast", "cholesterol_total", "triglycerides", "hdl", "ldl", "urea", "creatinine", "egfr", "crp", "uric_acid", "iron", "calcium_total", "potassium", "sodium":
+			biochemistry++
+		}
+	}
+	if biochemistry >= 2 || hasAny("биохимический анализ крови") {
+		return "Кровь · биохимия"
+	}
+	return "Лабораторное исследование"
 }
 func (s *Service) extract(ctx context.Context, path, mime string) (string, []string, error) {
 	if strings.Contains(mime, "pdf") {
@@ -742,15 +797,19 @@ func emptyReview() domain.AIReview {
 func failedReview() domain.AIReview {
 	return domain.AIReview{Summary: "Не удалось распознать документ. Оригинал сохранён — попробуйте загрузить более чёткое фото или PDF.", Lifestyle: []string{}, Nutrition: []string{}, DoctorNeeded: false, Urgency: "routine", Disclaimer: "Автоматическая обработка не является диагнозом и не заменяет консультацию врача.", Provider: "rules"}
 }
-func (s *Service) deepSeek(ctx context.Context, text string) ([]domain.Marker, domain.AIReview, error) {
+func (s *Service) deepSeek(ctx context.Context, text string, profile *domain.PatientProfile) ([]domain.Marker, domain.AIReview, error) {
 	type msg struct{ Role, Content string }
+	profileContext := "Профиль пациента не заполнен."
+	if profile != nil {
+		profileContext = fmt.Sprintf("Возраст %d лет, рост %.0f см, вес %.1f кг, ИМТ %.1f.", profile.Age, profile.HeightCM, profile.WeightKG, profile.BMI)
+	}
 	payload := map[string]any{
 		"model":           s.cfg.DeepSeekModel,
 		"temperature":     0.1,
 		"max_tokens":      4096,
 		"thinking":        map[string]string{"type": "disabled"},
 		"response_format": map[string]string{"type": "json_object"},
-		"messages":        []msg{{"system", "Ты медицинский модуль структурирования лабораторных бланков. Верни только json-объект: markers (поля name, canonical_name, value, text_value, unit, reference_min, reference_max, reference_text, status low|normal|high|unknown) и ai_review (summary, lifestyle[], nutrition[], doctor_needed, urgency routine|soon|urgent, suggested_specialty). Не ставь диагноз. Не выдумывай отсутствующие значения."}, {"user", text}},
+		"messages":        []msg{{"system", "Ты медицинский модуль структурирования лабораторных бланков. Верни только json-объект: markers (поля name, canonical_name, value, text_value, unit, reference_min, reference_max, reference_text, status low|normal|high|unknown) и ai_review (summary, lifestyle[], nutrition[], doctor_needed, urgency routine|soon|urgent, suggested_specialty). Summary должен быть кратким и понятным пациенту, учитывать возраст и ИМТ, отмечать отклонения и при их наличии рекомендовать профиль специалиста. Не ставь диагноз, не назначай препараты, не выдумывай отсутствующие значения. ИМТ используй только как контекст, а не как диагноз."}, {"user", profileContext + "\n\nТекст бланка:\n" + text}},
 	}
 	b, _ := json.Marshal(payload)
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.cfg.DeepSeekBaseURL, "/")+"/chat/completions", bytes.NewReader(b))
@@ -784,4 +843,135 @@ func (s *Service) deepSeek(ctx context.Context, text string) ([]domain.Marker, d
 	out.AIReview.Provider = "deepseek"
 	out.AIReview.Disclaimer = "Автоматическая оценка не является диагнозом и не заменяет консультацию врача. При резком ухудшении самочувствия обратитесь за неотложной помощью."
 	return out.Markers, out.AIReview, nil
+}
+
+type SymptomResult struct {
+	Accepted  bool   `json:"accepted"`
+	Title     string `json:"title"`
+	Answer    string `json:"answer"`
+	Specialty string `json:"specialty"`
+}
+
+type ClinicalAssistResult struct {
+	Assessment      string   `json:"assessment"`
+	RedFlags        []string `json:"red_flags"`
+	SuggestedChecks []string `json:"suggested_checks"`
+	Tactics         []string `json:"tactics"`
+	GuidelineRefs   []string `json:"guideline_refs"`
+	Limitations     string   `json:"limitations"`
+}
+
+func (s *Service) Recommendation(ctx context.Context, kind string, profile domain.PatientProfile, analyses []domain.Analysis) (string, error) {
+	fallback := "Поддерживайте регулярный режим и меняйте привычки постепенно. Индивидуальные ограничения и интенсивность нагрузок согласуйте с врачом."
+	if kind == "nutrition" {
+		fallback = "Старайтесь питаться регулярно, чаще выбирать овощи и продукты с клетчаткой, а избыток жирной пищи и быстрых углеводов уменьшать постепенно. Индивидуальную диету согласуйте с врачом."
+	}
+	if s.cfg.DeepSeekAPIKey == "" {
+		return fallback, nil
+	}
+	survey, _ := json.Marshal(profile)
+	context := compactAnalysisContext(analyses)
+	system := "Ты формируешь безопасную персональную рекомендацию по образу жизни для пациента. Используй возраст, ИМТ, ответы анкеты и только перечисленные лабораторные данные. Не ставь диагноз, не назначай лекарства и не предлагай экстремальные нагрузки или диеты. Ответ на русском, 3-5 коротких конкретных пунктов и отдельная строка, когда нужна очная консультация."
+	if kind == "nutrition" {
+		system = "Ты формируешь безопасную персональную рекомендацию по питанию. Используй возраст, ИМТ, ответы анкеты и только перечисленные лабораторные данные. Не ставь диагноз, не назначай лекарства и не предлагай лечебную или экстремальную диету. Ответ на русском, 3-5 коротких конкретных пунктов и отдельная строка, когда нужна консультация врача или диетолога."
+	}
+	var out struct {
+		Recommendation string `json:"recommendation"`
+	}
+	err := s.completeJSON(ctx, system+" Верни JSON {recommendation}.", "Профиль и анкеты: "+string(survey)+"\nПоследние анализы: "+context, &out)
+	if err != nil || strings.TrimSpace(out.Recommendation) == "" {
+		if err == nil {
+			err = fmt.Errorf("empty recommendation")
+		}
+		return fallback, err
+	}
+	return out.Recommendation, nil
+}
+
+func (s *Service) SymptomConsultation(ctx context.Context, profile *domain.PatientProfile, question string, analyses []domain.Analysis) (SymptomResult, error) {
+	if s.cfg.DeepSeekAPIKey == "" {
+		return SymptomResult{}, fmt.Errorf("ai service is not configured")
+	}
+	profileJSON, _ := json.Marshal(profile)
+	system := "Ты выполняешь только первичную безопасную маршрутизацию жалоб пациента. Определи, относится ли текст к состоянию здоровья. Если нет, accepted=false и в answer ровно сообщи, что принимается только информация о состоянии здоровья. Если да: кратко объясни разумные следующие действия, тревожные признаки для срочной помощи и к какому одному профильному специалисту обратиться. Не ставь диагноз, не назначай препараты и дозировки. Учитывай профиль и лабораторные данные, но не делай причинных выводов только по ним. Верни JSON: accepted, title (до 60 символов), answer, specialty."
+	var out SymptomResult
+	err := s.completeJSON(ctx, system, "Профиль: "+string(profileJSON)+"\nПоследние анализы: "+compactAnalysisContext(analyses)+"\nСообщение пациента: "+strings.TrimSpace(question), &out)
+	return out, err
+}
+
+func (s *Service) ClinicalAssist(ctx context.Context, patient domain.User, objective, clinical string, analyses []domain.Analysis) (ClinicalAssistResult, error) {
+	if s.cfg.DeepSeekAPIKey == "" {
+		return ClinicalAssistResult{}, fmt.Errorf("ai service is not configured")
+	}
+	profileJSON, _ := json.Marshal(patient.PatientProfile)
+	system := "Ты модуль поддержки клинического решения только для врача. Работай исключительно с предоставленными данными, явно отмечай недостаток информации и не выдумывай факты. Сформируй дифференциальное клиническое рассуждение, красные флаги, что уточнить/проверить и осторожную тактику без назначения конкретных препаратов и доз. Ссылки указывай только как название организации, документа и год; если не уверен в актуальности или точном документе, не придумывай ссылку и напиши, что врачу нужно свериться с действующей редакцией официального источника. Не утверждай, что ответ заменяет клиническое решение. Верни JSON: assessment, red_flags[], suggested_checks[], tactics[], guideline_refs[], limitations."
+	user := "Профиль пациента: " + string(profileJSON) + "\nОбъективные данные: " + strings.TrimSpace(objective) + "\nКлинические данные: " + strings.TrimSpace(clinical) + "\nДоступные анализы:\n" + compactAnalysisContext(analyses)
+	var out ClinicalAssistResult
+	err := s.completeJSON(ctx, system, user, &out)
+	if strings.TrimSpace(out.Limitations) == "" {
+		out.Limitations = "Рекомендация носит справочный характер: проверьте её по действующей редакции клинических рекомендаций и сопоставьте с полной клинической картиной."
+	}
+	return out, err
+}
+
+func compactAnalysisContext(analyses []domain.Analysis) string {
+	if len(analyses) == 0 {
+		return "нет данных"
+	}
+	if len(analyses) > 3 {
+		analyses = analyses[:3]
+	}
+	var lines []string
+	for _, analysis := range analyses {
+		var markers []string
+		for _, marker := range analysis.Markers {
+			if marker.Status != domain.StatusNormal || len(markers) < 6 {
+				value := marker.TextValue
+				if marker.Value != nil {
+					value = fmt.Sprintf("%g", *marker.Value)
+				}
+				markers = append(markers, fmt.Sprintf("%s=%s %s (%s)", marker.Name, value, marker.Unit, marker.Status))
+			}
+		}
+		lines = append(lines, analysis.CreatedAt.Format("02.01.2006")+" "+analysis.Title+": "+strings.Join(markers, ", "))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (s *Service) completeJSON(ctx context.Context, system, user string, out any) error {
+	type msg struct{ Role, Content string }
+	payload := map[string]any{
+		"model":           s.cfg.DeepSeekModel,
+		"temperature":     0.1,
+		"max_tokens":      1400,
+		"thinking":        map[string]string{"type": "disabled"},
+		"response_format": map[string]string{"type": "json_object"},
+		"messages":        []msg{{"system", system}, {"user", user}},
+	}
+	b, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.cfg.DeepSeekBaseURL, "/")+"/chat/completions", bytes.NewReader(b))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+s.cfg.DeepSeekAPIKey)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("deepseek status %d", resp.StatusCode)
+	}
+	var envelope struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err = json.NewDecoder(resp.Body).Decode(&envelope); err != nil || len(envelope.Choices) == 0 {
+		return fmt.Errorf("invalid deepseek response")
+	}
+	return json.Unmarshal([]byte(envelope.Choices[0].Message.Content), out)
 }

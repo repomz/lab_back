@@ -42,6 +42,18 @@ func (s *Mongo) UserByID(ctx context.Context, id primitive.ObjectID) (domain.Use
 	err := s.db.Collection("users").FindOne(ctx, bson.M{"_id": id}).Decode(&u)
 	return u, err
 }
+func (s *Mongo) UpdatePatientProfile(ctx context.Context, id primitive.ObjectID, profile domain.PatientProfile) (domain.User, error) {
+	profile.UpdatedAt = time.Now().UTC()
+	r := s.db.Collection("users").FindOneAndUpdate(
+		ctx,
+		bson.M{"_id": id, "role": domain.RolePatient},
+		bson.M{"$set": bson.M{"patient_profile": profile}},
+		options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(bson.M{"password_hash": 0}),
+	)
+	var u domain.User
+	err := r.Decode(&u)
+	return u, err
+}
 func (s *Mongo) Doctors(ctx context.Context, specialty string) ([]domain.User, error) {
 	f := bson.M{"role": domain.RoleDoctor}
 	if specialty != "" {
@@ -118,9 +130,45 @@ func (s *Mongo) CreateConsultation(ctx context.Context, c *domain.Consultation) 
 	now := time.Now().UTC()
 	c.CreatedAt = now
 	c.UpdatedAt = now
-	c.Status = "requested"
+	if c.Status == "" {
+		c.Status = "requested"
+	}
 	_, err := s.db.Collection("consultations").InsertOne(ctx, c)
 	return err
+}
+func (s *Mongo) PatientsForDoctor(ctx context.Context, doctor primitive.ObjectID) ([]domain.User, error) {
+	ids, err := s.db.Collection("consultations").Distinct(ctx, "patient_id", bson.M{"doctor_id": doctor})
+	if err != nil || len(ids) == 0 {
+		return []domain.User{}, err
+	}
+	objectIDs := make([]primitive.ObjectID, 0, len(ids))
+	for _, raw := range ids {
+		if id, ok := raw.(primitive.ObjectID); ok {
+			objectIDs = append(objectIDs, id)
+		}
+	}
+	cur, err := s.db.Collection("users").Find(ctx, bson.M{"_id": bson.M{"$in": objectIDs}}, options.Find().SetProjection(bson.M{"password_hash": 0}).SetSort(bson.D{{Key: "full_name", Value: 1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []domain.User
+	if err = cur.All(ctx, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+func (s *Mongo) SharedAnalysesForPatient(ctx context.Context, doctor, patient primitive.ObjectID) ([]domain.Analysis, error) {
+	cur, err := s.db.Collection("analyses").Find(ctx, bson.M{"owner_id": patient, "shared_with": doctor}, options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []domain.Analysis
+	if err = cur.All(ctx, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 func (s *Mongo) Consultations(ctx context.Context, user primitive.ObjectID, role domain.Role) ([]domain.Consultation, error) {
 	key := "patient_id"
