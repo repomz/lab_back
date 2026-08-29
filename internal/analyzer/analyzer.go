@@ -798,7 +798,10 @@ func failedReview() domain.AIReview {
 	return domain.AIReview{Summary: "Не удалось распознать документ. Оригинал сохранён — попробуйте загрузить более чёткое фото или PDF.", Lifestyle: []string{}, Nutrition: []string{}, DoctorNeeded: false, Urgency: "routine", Disclaimer: "Автоматическая обработка не является диагнозом и не заменяет консультацию врача.", Provider: "rules"}
 }
 func (s *Service) deepSeek(ctx context.Context, text string, profile *domain.PatientProfile) ([]domain.Marker, domain.AIReview, error) {
-	type msg struct{ Role, Content string }
+	type msg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
 	profileContext := "Профиль пациента не заполнен."
 	if profile != nil {
 		profileContext = fmt.Sprintf("Возраст %d лет, рост %.0f см, вес %.1f кг, ИМТ %.1f.", profile.Age, profile.HeightCM, profile.WeightKG, profile.BMI)
@@ -939,7 +942,10 @@ func compactAnalysisContext(analyses []domain.Analysis) string {
 }
 
 func (s *Service) completeJSON(ctx context.Context, system, user string, out any) error {
-	type msg struct{ Role, Content string }
+	type msg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
 	payload := map[string]any{
 		"model":           s.cfg.DeepSeekModel,
 		"temperature":     0.1,

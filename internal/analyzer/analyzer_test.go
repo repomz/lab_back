@@ -1,9 +1,14 @@
 package analyzer
 
 import (
+	"context"
+	"encoding/json"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
+	"github.com/repomz/lab_back/internal/config"
 	"github.com/repomz/lab_back/internal/domain"
 )
 
@@ -17,6 +22,36 @@ func TestParseMarkers(t *testing.T) {
 	}
 	if string(m[1].Status) != "normal" {
 		t.Fatalf("status %s", m[1].Status)
+	}
+}
+
+func TestCompleteJSONUsesDeepSeekMessageFieldNames(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		messages := payload["messages"].([]any)
+		first := messages[0].(map[string]any)
+		if first["role"] != "system" || first["content"] != "system prompt" {
+			t.Fatalf("wrong message JSON: %#v", first)
+		}
+		if _, exists := first["Role"]; exists {
+			t.Fatalf("DeepSeek message fields must be lowercase: %#v", first)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"{\"answer\":\"ok\"}"}}]}`))
+	}))
+	defer server.Close()
+	service := New(config.Config{DeepSeekAPIKey: "test", DeepSeekBaseURL: server.URL, DeepSeekModel: "test"})
+	var result struct {
+		Answer string `json:"answer"`
+	}
+	if err := service.completeJSON(context.Background(), "system prompt", "user prompt", &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Answer != "ok" {
+		t.Fatalf("answer=%q", result.Answer)
 	}
 }
 
