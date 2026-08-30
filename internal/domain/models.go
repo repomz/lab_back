@@ -112,20 +112,22 @@ type Analysis struct {
 }
 
 type Consultation struct {
-	ID            primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	AnalysisID    primitive.ObjectID `bson:"analysis_id,omitempty" json:"analysis_id,omitempty"`
-	PatientID     primitive.ObjectID `bson:"patient_id" json:"patient_id"`
-	DoctorID      primitive.ObjectID `bson:"doctor_id,omitempty" json:"doctor_id,omitempty"`
-	Source        string             `bson:"source" json:"source"`
-	Title         string             `bson:"title" json:"title"`
-	Specialty     string             `bson:"specialty,omitempty" json:"specialty,omitempty"`
-	ServiceType   string             `bson:"service_type,omitempty" json:"service_type,omitempty"`
-	AppointmentAt *time.Time         `bson:"appointment_at,omitempty" json:"appointment_at,omitempty"`
-	Question      string             `bson:"question" json:"question"`
-	Reply         string             `bson:"reply,omitempty" json:"reply,omitempty"`
-	Status        string             `bson:"status" json:"status"`
-	CreatedAt     time.Time          `bson:"created_at" json:"created_at"`
-	UpdatedAt     time.Time          `bson:"updated_at" json:"updated_at"`
+	ID                  primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	AnalysisID          primitive.ObjectID `bson:"analysis_id,omitempty" json:"analysis_id,omitempty"`
+	PatientID           primitive.ObjectID `bson:"patient_id" json:"patient_id"`
+	DoctorID            primitive.ObjectID `bson:"doctor_id,omitempty" json:"doctor_id,omitempty"`
+	Source              string             `bson:"source" json:"source"`
+	Title               string             `bson:"title" json:"title"`
+	Specialty           string             `bson:"specialty,omitempty" json:"specialty,omitempty"`
+	ServiceType         string             `bson:"service_type,omitempty" json:"service_type,omitempty"`
+	AppointmentAt       *time.Time         `bson:"appointment_at,omitempty" json:"appointment_at,omitempty"`
+	PersonalDataConsent bool               `bson:"personal_data_consent" json:"personal_data_consent"`
+	MedicalDataConsent  bool               `bson:"medical_data_consent" json:"medical_data_consent"`
+	Question            string             `bson:"question" json:"question"`
+	Reply               string             `bson:"reply,omitempty" json:"reply,omitempty"`
+	Status              string             `bson:"status" json:"status"`
+	CreatedAt           time.Time          `bson:"created_at" json:"created_at"`
+	UpdatedAt           time.Time          `bson:"updated_at" json:"updated_at"`
 }
 
 type ScheduleSlot struct {

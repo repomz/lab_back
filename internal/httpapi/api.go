@@ -658,7 +658,11 @@ func (a *API) createConsultation(w http.ResponseWriter, r *http.Request) {
 		write(w, 403, map[string]string{"error": "only patients can request consultations"})
 		return
 	}
-	var in struct{ AnalysisID, DoctorID, Question, ServiceType, AppointmentAt string }
+	var in struct {
+		AnalysisID, DoctorID, Question, ServiceType, AppointmentAt string
+		PersonalDataConsent                                        bool `json:"personalDataConsent"`
+		MedicalDataConsent                                         bool `json:"medicalDataConsent"`
+	}
 	if decode(r, &in) != nil {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
 		return
@@ -693,6 +697,12 @@ func (a *API) createConsultation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if in.MedicalDataConsent {
+		if e = a.store.ShareAllAnalyses(r.Context(), u.ID, did); e != nil {
+			write(w, 500, map[string]string{"error": "could not grant access to examinations"})
+			return
+		}
+	}
 	serviceType := strings.TrimSpace(in.ServiceType)
 	if serviceType == "" {
 		serviceType = "consultation"
@@ -721,7 +731,7 @@ func (a *API) createConsultation(w http.ResponseWriter, r *http.Request) {
 		write(w, 422, map[string]string{"error": "выберите время приёма"})
 		return
 	}
-	c := domain.Consultation{ID: primitive.NewObjectID(), AnalysisID: aid, PatientID: u.ID, DoctorID: did, Source: "doctor", Title: title, Specialty: doctor.Specialization, ServiceType: serviceType, AppointmentAt: appointmentAt, Question: strings.TrimSpace(in.Question)}
+	c := domain.Consultation{ID: primitive.NewObjectID(), AnalysisID: aid, PatientID: u.ID, DoctorID: did, Source: "doctor", Title: title, Specialty: doctor.Specialization, ServiceType: serviceType, AppointmentAt: appointmentAt, PersonalDataConsent: in.PersonalDataConsent, MedicalDataConsent: in.MedicalDataConsent, Question: strings.TrimSpace(in.Question)}
 	if serviceType == "appointment" {
 		if e = a.store.ReserveSlot(r.Context(), did, u.ID, c.ID, appointmentAt.UTC()); e != nil {
 			write(w, 409, map[string]string{"error": "это время уже занято; выберите другое"})

@@ -125,6 +125,10 @@ func (s *Mongo) Share(ctx context.Context, analysis, owner, doctor primitive.Obj
 	}
 	return err
 }
+func (s *Mongo) ShareAllAnalyses(ctx context.Context, owner, doctor primitive.ObjectID) error {
+	_, err := s.db.Collection("analyses").UpdateMany(ctx, bson.M{"owner_id": owner}, bson.M{"$addToSet": bson.M{"shared_with": doctor}, "$set": bson.M{"updated_at": time.Now().UTC()}})
+	return err
+}
 func (s *Mongo) UpdateAnalysisRecognition(ctx context.Context, id, owner primitive.ObjectID, text string, markers []domain.Marker, review domain.AIReview, status string) error {
 	r, err := s.db.Collection("analyses").UpdateOne(ctx,
 		bson.M{"_id": id, "owner_id": owner},
@@ -181,6 +185,27 @@ func (s *Mongo) PatientsForDoctor(ctx context.Context, doctor primitive.ObjectID
 	if err = cur.All(ctx, &out); err != nil {
 		return nil, err
 	}
+	consentedRaw, err := s.db.Collection("consultations").Distinct(ctx, "patient_id", bson.M{"doctor_id": doctor, "personal_data_consent": true})
+	if err != nil {
+		return nil, err
+	}
+	consented := make(map[primitive.ObjectID]bool, len(consentedRaw))
+	for _, raw := range consentedRaw {
+		if id, ok := raw.(primitive.ObjectID); ok {
+			consented[id] = true
+		}
+	}
+	for i := range out {
+		if consented[out[i].ID] {
+			continue
+		}
+		out[i].FullName = "Пациент без доступа к личным данным"
+		out[i].Email = ""
+		out[i].PatientProfile = nil
+		out[i].AvatarPath = ""
+		out[i].AvatarPreset = ""
+		out[i].AvatarUpdatedAt = nil
+	}
 	return out, nil
 }
 func (s *Mongo) SharedAnalysesForPatient(ctx context.Context, doctor, patient primitive.ObjectID) ([]domain.Analysis, error) {
@@ -228,7 +253,11 @@ func (s *Mongo) Schedule(ctx context.Context, doctor primitive.ObjectID, from, t
 		return nil, err
 	}
 	for i := range out {
-		if !out[i].PatientID.IsZero() {
+		if !out[i].PatientID.IsZero() && !out[i].AppointmentID.IsZero() {
+			var consultation domain.Consultation
+			if e := s.db.Collection("consultations").FindOne(ctx, bson.M{"_id": out[i].AppointmentID, "personal_data_consent": true}).Decode(&consultation); e != nil {
+				continue
+			}
 			if patient, e := s.UserByID(ctx, out[i].PatientID); e == nil {
 				out[i].PatientName = patient.FullName
 			}
