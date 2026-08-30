@@ -130,6 +130,14 @@ type Consultation struct {
 	UpdatedAt           time.Time          `bson:"updated_at" json:"updated_at"`
 }
 
+type SupportMessage struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	UserID    primitive.ObjectID `bson:"user_id" json:"user_id"`
+	Sender    string             `bson:"sender" json:"sender"`
+	Text      string             `bson:"text" json:"text"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+}
+
 type ScheduleSlot struct {
 	ID            primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	DoctorID      primitive.ObjectID `bson:"doctor_id" json:"doctor_id"`

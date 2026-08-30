@@ -66,6 +66,8 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Post("/api/v1/consultations", api.createConsultation)
 		r.Post("/api/v1/consultations/ai", api.createAIConsultation)
 		r.Patch("/api/v1/consultations/{id}", api.reply)
+		r.Get("/api/v1/support/messages", api.supportMessages)
+		r.Post("/api/v1/support/messages", api.createSupportMessage)
 		r.Post("/api/v1/recommendations/{kind}", api.recommendation)
 		r.Post("/api/v1/clinical-assist", api.clinicalAssist)
 		r.Get("/api/v1/doctors/{id}/schedule", api.schedule)
@@ -651,6 +653,47 @@ func (a *API) consultations(w http.ResponseWriter, r *http.Request) {
 		list = []domain.Consultation{}
 	}
 	write(w, 200, list)
+}
+func (a *API) supportMessages(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RolePatient {
+		write(w, 403, map[string]string{"error": "support chat is available to patients"})
+		return
+	}
+	list, err := a.store.SupportMessages(r.Context(), u.ID)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "could not load support chat"})
+		return
+	}
+	if list == nil {
+		list = []domain.SupportMessage{}
+	}
+	write(w, 200, list)
+}
+func (a *API) createSupportMessage(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RolePatient {
+		write(w, 403, map[string]string{"error": "support chat is available to patients"})
+		return
+	}
+	var in struct {
+		Text string `json:"text"`
+	}
+	if decode(r, &in) != nil {
+		write(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	in.Text = strings.TrimSpace(in.Text)
+	if in.Text == "" || len([]rune(in.Text)) > 4000 {
+		write(w, 422, map[string]string{"error": "message must contain 1 to 4000 characters"})
+		return
+	}
+	message := domain.SupportMessage{UserID: u.ID, Sender: "patient", Text: in.Text}
+	if err := a.store.CreateSupportMessage(r.Context(), &message); err != nil {
+		write(w, 500, map[string]string{"error": "could not send support message"})
+		return
+	}
+	write(w, 201, message)
 }
 func (a *API) createConsultation(w http.ResponseWriter, r *http.Request) {
 	u := current(r)

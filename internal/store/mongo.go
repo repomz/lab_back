@@ -234,6 +234,28 @@ func (s *Mongo) Consultations(ctx context.Context, user primitive.ObjectID, role
 	err = cur.All(ctx, &out)
 	return out, err
 }
+
+func (s *Mongo) SupportMessages(ctx context.Context, user primitive.ObjectID) ([]domain.SupportMessage, error) {
+	cur, err := s.db.Collection("support_messages").Find(ctx, bson.M{"user_id": user}, options.Find().SetSort(bson.D{{Key: "created_at", Value: 1}}).SetLimit(300))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []domain.SupportMessage
+	err = cur.All(ctx, &out)
+	return out, err
+}
+
+func (s *Mongo) CreateSupportMessage(ctx context.Context, message *domain.SupportMessage) error {
+	if message.ID.IsZero() {
+		message.ID = primitive.NewObjectID()
+	}
+	if message.CreatedAt.IsZero() {
+		message.CreatedAt = time.Now().UTC()
+	}
+	_, err := s.db.Collection("support_messages").InsertOne(ctx, message)
+	return err
+}
 func (s *Mongo) Reply(ctx context.Context, id, doctor primitive.ObjectID, reply, status string) error {
 	r, err := s.db.Collection("consultations").UpdateOne(ctx, bson.M{"_id": id, "doctor_id": doctor}, bson.M{"$set": bson.M{"reply": reply, "status": status, "updated_at": time.Now().UTC()}})
 	if err == nil && r.MatchedCount == 0 {
