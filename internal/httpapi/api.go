@@ -45,7 +45,6 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ok"}) })
 	r.Post("/api/v1/auth/register", api.register)
 	r.Post("/api/v1/auth/login", api.login)
-	r.Post("/api/v1/auth/set-pin", api.setPIN)
 	r.Group(func(r chi.Router) {
 		r.Use(api.authorize)
 		r.Get("/api/v1/me", api.me)
@@ -142,9 +141,9 @@ func current(r *http.Request) actor { return r.Context().Value(actorKey).(actor)
 
 func (a *API) register(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Email, Password, Role, FullName, Specialization, LicenseNumber string
-		Age                                                            int
-		HeightCM, WeightKG                                             float64
+		Email, PIN, Role, FullName, Specialization, LicenseNumber string
+		Age                                                       int
+		HeightCM, WeightKG                                        float64
 	}
 	if decode(r, &in) != nil {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
@@ -156,7 +155,7 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 		in.FullName = in.Email
 	}
 	role := domain.Role(in.Role)
-	if in.Email == "" || in.Password == "" || (role != domain.RolePatient && role != domain.RoleDoctor) {
+	if in.Email == "" || !validPIN(in.PIN) || (role != domain.RolePatient && role != domain.RoleDoctor) {
 		write(w, 422, map[string]string{"error": "логин, PIN и роль обязательны"})
 		return
 	}
@@ -164,7 +163,7 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 		write(w, 422, map[string]string{"error": "specialization is required for doctors"})
 		return
 	}
-	h, e := auth.Hash(in.Password)
+	h, e := auth.Hash(in.PIN)
 	if e != nil {
 		write(w, 500, map[string]string{"error": "registration failed"})
 		return
@@ -190,48 +189,33 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 	write(w, 201, map[string]any{"token": token, "user": u})
 }
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Email, Password string }
+	var in struct{ Email, PIN string }
 	if decode(r, &in) != nil {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
+	if strings.TrimSpace(in.Email) == "" || !validPIN(in.PIN) {
+		write(w, 422, map[string]string{"error": "введите логин и PIN из четырёх цифр"})
+		return
+	}
 	u, e := a.store.UserByEmail(r.Context(), strings.ToLower(strings.TrimSpace(in.Email)))
-	if e != nil || !auth.Verify(u.PasswordHash, in.Password) {
+	if e != nil || !auth.Verify(u.PasswordHash, in.PIN) {
 		write(w, 401, map[string]string{"error": "неверный логин или PIN"})
 		return
 	}
 	token, _ := auth.Sign(a.cfg.JWTSecret, u.ID.Hex(), string(u.Role))
 	write(w, 200, map[string]any{"token": token, "user": u})
 }
-func (a *API) setPIN(w http.ResponseWriter, r *http.Request) {
-	var in struct {
-		Email, CurrentPassword, PIN string
+func validPIN(value string) bool {
+	if len(value) != 4 {
+		return false
 	}
-	if decode(r, &in) != nil {
-		write(w, 400, map[string]string{"error": "invalid JSON"})
-		return
+	for _, digit := range value {
+		if digit < '0' || digit > '9' {
+			return false
+		}
 	}
-	if len(in.PIN) != 4 || strings.Trim(in.PIN, "0123456789") != "" {
-		write(w, 422, map[string]string{"error": "PIN должен состоять из четырёх цифр"})
-		return
-	}
-	u, err := a.store.UserByEmail(r.Context(), strings.ToLower(strings.TrimSpace(in.Email)))
-	if err != nil || !auth.Verify(u.PasswordHash, in.CurrentPassword) {
-		write(w, 401, map[string]string{"error": "неверный логин или текущий пароль"})
-		return
-	}
-	hash, err := auth.Hash(in.PIN)
-	if err != nil {
-		write(w, 500, map[string]string{"error": "не удалось сохранить PIN"})
-		return
-	}
-	u, err = a.store.UpdatePasswordHash(r.Context(), u.ID, hash)
-	if err != nil {
-		write(w, 500, map[string]string{"error": "не удалось сохранить PIN"})
-		return
-	}
-	token, _ := auth.Sign(a.cfg.JWTSecret, u.ID.Hex(), string(u.Role))
-	write(w, 200, map[string]any{"token": token, "user": u})
+	return true
 }
 func (a *API) me(w http.ResponseWriter, r *http.Request) {
 	u, e := a.store.UserByID(r.Context(), current(r).ID)

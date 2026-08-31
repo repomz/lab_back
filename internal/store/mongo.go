@@ -69,12 +69,6 @@ func (s *Mongo) UpdateContactProfile(ctx context.Context, id primitive.ObjectID,
 	err := r.Decode(&u)
 	return u, err
 }
-func (s *Mongo) UpdatePasswordHash(ctx context.Context, id primitive.ObjectID, hash string) (domain.User, error) {
-	r := s.db.Collection("users").FindOneAndUpdate(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"password_hash": hash}}, options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(bson.M{"password_hash": 0}))
-	var u domain.User
-	err := r.Decode(&u)
-	return u, err
-}
 func (s *Mongo) UpdateAvatar(ctx context.Context, id primitive.ObjectID, path, preset string) (domain.User, error) {
 	now := time.Now().UTC()
 	set := bson.M{"avatar_updated_at": now}
