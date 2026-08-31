@@ -157,7 +157,7 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 	}
 	role := domain.Role(in.Role)
 	if in.Email == "" || in.Password == "" || (role != domain.RolePatient && role != domain.RoleDoctor) {
-		write(w, 422, map[string]string{"error": "логин, пароль и роль обязательны"})
+		write(w, 422, map[string]string{"error": "логин, PIN и роль обязательны"})
 		return
 	}
 	if role == domain.RoleDoctor && strings.TrimSpace(in.Specialization) == "" {
@@ -197,7 +197,7 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	}
 	u, e := a.store.UserByEmail(r.Context(), strings.ToLower(strings.TrimSpace(in.Email)))
 	if e != nil || !auth.Verify(u.PasswordHash, in.Password) {
-		write(w, 401, map[string]string{"error": "invalid credentials"})
+		write(w, 401, map[string]string{"error": "неверный логин или PIN"})
 		return
 	}
 	token, _ := auth.Sign(a.cfg.JWTSecret, u.ID.Hex(), string(u.Role))
