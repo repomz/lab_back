@@ -45,6 +45,7 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ok"}) })
 	r.Post("/api/v1/auth/register", api.register)
 	r.Post("/api/v1/auth/login", api.login)
+	r.Post("/api/v1/auth/set-pin", api.setPIN)
 	r.Group(func(r chi.Router) {
 		r.Use(api.authorize)
 		r.Get("/api/v1/me", api.me)
@@ -197,6 +198,36 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	u, e := a.store.UserByEmail(r.Context(), strings.ToLower(strings.TrimSpace(in.Email)))
 	if e != nil || !auth.Verify(u.PasswordHash, in.Password) {
 		write(w, 401, map[string]string{"error": "invalid credentials"})
+		return
+	}
+	token, _ := auth.Sign(a.cfg.JWTSecret, u.ID.Hex(), string(u.Role))
+	write(w, 200, map[string]any{"token": token, "user": u})
+}
+func (a *API) setPIN(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Email, CurrentPassword, PIN string
+	}
+	if decode(r, &in) != nil {
+		write(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if len(in.PIN) != 4 || strings.Trim(in.PIN, "0123456789") != "" {
+		write(w, 422, map[string]string{"error": "PIN должен состоять из четырёх цифр"})
+		return
+	}
+	u, err := a.store.UserByEmail(r.Context(), strings.ToLower(strings.TrimSpace(in.Email)))
+	if err != nil || !auth.Verify(u.PasswordHash, in.CurrentPassword) {
+		write(w, 401, map[string]string{"error": "неверный логин или текущий пароль"})
+		return
+	}
+	hash, err := auth.Hash(in.PIN)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "не удалось сохранить PIN"})
+		return
+	}
+	u, err = a.store.UpdatePasswordHash(r.Context(), u.ID, hash)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "не удалось сохранить PIN"})
 		return
 	}
 	token, _ := auth.Sign(a.cfg.JWTSecret, u.ID.Hex(), string(u.Role))
