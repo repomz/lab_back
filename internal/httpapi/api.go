@@ -48,6 +48,7 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(api.authorize)
 		r.Get("/api/v1/me", api.me)
+		r.Patch("/api/v1/me/contact-profile", api.updateContactProfile)
 		r.Patch("/api/v1/me/patient-profile", api.updatePatientProfile)
 		r.Post("/api/v1/me/avatar", api.uploadAvatar)
 		r.Patch("/api/v1/me/avatar-preset", api.avatarPreset)
@@ -358,6 +359,35 @@ func (a *API) updatePatientProfile(w http.ResponseWriter, r *http.Request) {
 	updated, err := a.store.UpdatePatientProfile(r.Context(), u.ID, profile)
 	if err != nil {
 		write(w, 500, map[string]string{"error": "could not update profile"})
+		return
+	}
+	write(w, 200, updated)
+}
+func (a *API) updateContactProfile(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	var in struct {
+		FullName           string `json:"fullName"`
+		Phone              string `json:"phone"`
+		ResidentialAddress string `json:"residentialAddress"`
+	}
+	if decode(r, &in) != nil {
+		write(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	in.FullName = strings.TrimSpace(in.FullName)
+	in.Phone = strings.TrimSpace(in.Phone)
+	in.ResidentialAddress = strings.TrimSpace(in.ResidentialAddress)
+	if in.FullName == "" || len([]rune(in.FullName)) > 120 {
+		write(w, 422, map[string]string{"error": "укажите имя длиной до 120 символов"})
+		return
+	}
+	if len([]rune(in.Phone)) > 32 || len([]rune(in.ResidentialAddress)) > 300 {
+		write(w, 422, map[string]string{"error": "проверьте телефон и адрес"})
+		return
+	}
+	updated, err := a.store.UpdateContactProfile(r.Context(), u.ID, in.FullName, in.Phone, in.ResidentialAddress)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "could not update contact profile"})
 		return
 	}
 	write(w, 200, updated)

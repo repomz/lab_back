@@ -14,21 +14,23 @@ const (
 )
 
 type User struct {
-	ID               primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	Email            string             `bson:"email" json:"email"`
-	PasswordHash     string             `bson:"password_hash" json:"-"`
-	Role             Role               `bson:"role" json:"role"`
-	FullName         string             `bson:"full_name" json:"full_name"`
-	Specialization   string             `bson:"specialization,omitempty" json:"specialization,omitempty"`
-	LicenseNumber    string             `bson:"license_number,omitempty" json:"license_number,omitempty"`
-	Verified         bool               `bson:"verified" json:"verified"`
-	PatientProfile   *PatientProfile    `bson:"patient_profile,omitempty" json:"patient_profile,omitempty"`
-	HomeVisits       bool               `bson:"home_visits,omitempty" json:"home_visits,omitempty"`
-	AppointmentSlots []time.Time        `bson:"appointment_slots,omitempty" json:"appointment_slots,omitempty"`
-	AvatarPath       string             `bson:"avatar_path,omitempty" json:"-"`
-	AvatarPreset     string             `bson:"avatar_preset,omitempty" json:"avatar_preset,omitempty"`
-	AvatarUpdatedAt  *time.Time         `bson:"avatar_updated_at,omitempty" json:"avatar_updated_at,omitempty"`
-	CreatedAt        time.Time          `bson:"created_at" json:"created_at"`
+	ID                 primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Email              string             `bson:"email" json:"email"`
+	PasswordHash       string             `bson:"password_hash" json:"-"`
+	Role               Role               `bson:"role" json:"role"`
+	FullName           string             `bson:"full_name" json:"full_name"`
+	Phone              string             `bson:"phone,omitempty" json:"phone,omitempty"`
+	ResidentialAddress string             `bson:"residential_address,omitempty" json:"residential_address,omitempty"`
+	Specialization     string             `bson:"specialization,omitempty" json:"specialization,omitempty"`
+	LicenseNumber      string             `bson:"license_number,omitempty" json:"license_number,omitempty"`
+	Verified           bool               `bson:"verified" json:"verified"`
+	PatientProfile     *PatientProfile    `bson:"patient_profile,omitempty" json:"patient_profile,omitempty"`
+	HomeVisits         bool               `bson:"home_visits,omitempty" json:"home_visits,omitempty"`
+	AppointmentSlots   []time.Time        `bson:"appointment_slots,omitempty" json:"appointment_slots,omitempty"`
+	AvatarPath         string             `bson:"avatar_path,omitempty" json:"-"`
+	AvatarPreset       string             `bson:"avatar_preset,omitempty" json:"avatar_preset,omitempty"`
+	AvatarUpdatedAt    *time.Time         `bson:"avatar_updated_at,omitempty" json:"avatar_updated_at,omitempty"`
+	CreatedAt          time.Time          `bson:"created_at" json:"created_at"`
 }
 
 type ActivitySurvey struct {
