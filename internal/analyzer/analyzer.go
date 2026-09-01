@@ -238,9 +238,9 @@ func preprocessImage(ctx context.Context, path string) (string, func(), error) {
 	cleanup := func() { _ = os.RemoveAll(tmpDir) }
 	outputPath := filepath.Join(tmpDir, "normalized.png")
 	// OCR does not benefit from 12+ MP phone photos, while processing time grows
-	// roughly with pixel count. 1600 px keeps small lab-table text readable and
+	// roughly with pixel count. 1800 px keeps small lab-table text readable and
 	// prevents a single upload from occupying the small production CPU too long.
-	cmd := exec.CommandContext(ctx, "magick", path, "-auto-orient", "-resize", "1600x1600>", "-colorspace", "Gray", "-deskew", "40%", "-contrast-stretch", "1%x1%", "-sharpen", "0x1", outputPath)
+	cmd := exec.CommandContext(ctx, "magick", path, "-auto-orient", "-resize", "1800x1800>", "-colorspace", "Gray", "-deskew", "40%", "-contrast-stretch", "1%x1%", "-sharpen", "0x1", outputPath)
 	if output, commandErr := cmd.CombinedOutput(); commandErr != nil {
 		cleanup()
 		return path, nil, fmt.Errorf("magick: %v: %s", commandErr, output)
