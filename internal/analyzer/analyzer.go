@@ -43,25 +43,33 @@ func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, prof
 	markers := parseOCRCandidates(candidates)
 	review := ruleReview(markers)
 	if s.cfg.DeepSeekAPIKey != "" && strings.TrimSpace(text) != "" {
-		aiCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
-		m, r, e := s.deepSeek(aiCtx, text, profile)
-		cancel()
-		if e != nil {
-			log.Printf("deepseek structuring failed: %v", e)
-		} else if len(m) > 0 {
-			// An external language model may fill gaps, but it must never replace a
-			// stronger value that was read consistently by local OCR passes.
-			markers = mergeMarkerSets(markers, normalizeExternalMarkers(m))
-			fallback := ruleReview(markers)
-			if strings.TrimSpace(r.Summary) == "" {
-				r = fallback
+		aiCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if len(markers) >= 3 {
+			r, e := s.deepSeekReview(aiCtx, markers, profile)
+			if e != nil {
+				log.Printf("deepseek review failed: %v", e)
+			} else {
+				review = r
 			}
-			r.Provider = "deepseek"
-			r.Disclaimer = fallback.Disclaimer
-			review = r
 		} else {
-			log.Printf("deepseek structuring returned no markers")
+			m, r, e := s.deepSeek(aiCtx, text, profile)
+			if e != nil {
+				log.Printf("deepseek structuring failed: %v", e)
+			} else if len(m) > 0 {
+				// The model only fills gaps when local extraction is insufficient.
+				markers = mergeMarkerSets(markers, normalizeExternalMarkers(m))
+				fallback := ruleReview(markers)
+				if strings.TrimSpace(r.Summary) == "" {
+					r = fallback
+				}
+				r.Provider = "deepseek"
+				r.Disclaimer = fallback.Disclaimer
+				review = r
+			} else {
+				log.Printf("deepseek structuring returned no markers")
+			}
 		}
+		cancel()
 	}
 	status := "ready"
 	if len(markers) == 0 {
@@ -71,7 +79,7 @@ func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, prof
 		status = "needs_review"
 		review.Summary += " Часть полей распознана неуверенно — сверьте их с оригиналом."
 	}
-	log.Printf("recognition complete file=%s ocr=%s total=%s markers=%d status=%s", filepath.Base(path), ocrFinished.Sub(started).Round(time.Millisecond), time.Since(started).Round(time.Millisecond), len(markers), status)
+	log.Printf("recognition complete file=%s ocr=%s total=%s markers=%d status=%s review=%s", filepath.Base(path), ocrFinished.Sub(started).Round(time.Millisecond), time.Since(started).Round(time.Millisecond), len(markers), status, review.Provider)
 	return text, markers, review, status
 }
 
@@ -834,7 +842,7 @@ func (s *Service) deepSeek(ctx context.Context, text string, profile *domain.Pat
 	payload := map[string]any{
 		"model":           s.cfg.DeepSeekModel,
 		"temperature":     0.1,
-		"max_tokens":      2048,
+		"max_tokens":      4096,
 		"thinking":        map[string]string{"type": "disabled"},
 		"response_format": map[string]string{"type": "json_object"},
 		"messages":        []msg{{"system", "Ты медицинский модуль структурирования лабораторных бланков. Верни только json-объект: markers (поля name, canonical_name, value, text_value, unit, reference_min, reference_max, reference_text, status low|normal|high|unknown) и ai_review (summary, lifestyle[], nutrition[], doctor_needed, urgency routine|soon|urgent, suggested_specialty). Summary должен быть кратким и понятным пациенту, учитывать возраст и ИМТ, отмечать отклонения и при их наличии рекомендовать профиль специалиста. Не ставь диагноз, не назначай препараты, не выдумывай отсутствующие значения. ИМТ используй только как контекст, а не как диагноз."}, {"user", profileContext + "\n\nТекст бланка:\n" + text}},
@@ -871,6 +879,52 @@ func (s *Service) deepSeek(ctx context.Context, text string, profile *domain.Pat
 	out.AIReview.Provider = "deepseek"
 	out.AIReview.Disclaimer = "Автоматическая оценка не является диагнозом и не заменяет консультацию врача. При резком ухудшении самочувствия обратитесь за неотложной помощью."
 	return out.Markers, out.AIReview, nil
+}
+
+func (s *Service) deepSeekReview(ctx context.Context, markers []domain.Marker, profile *domain.PatientProfile) (domain.AIReview, error) {
+	profileContext := "Профиль пользователя не заполнен."
+	if profile != nil {
+		profileContext = fmt.Sprintf("Возраст %d лет, рост %.0f см, вес %.1f кг, ИМТ %.1f.", profile.Age, profile.HeightCM, profile.WeightKG, profile.BMI)
+	}
+	compact := make([]map[string]any, 0, len(markers))
+	for _, marker := range markers {
+		item := map[string]any{"name": marker.Name, "unit": marker.Unit, "status": marker.Status, "reference": marker.ReferenceText}
+		if marker.Value != nil {
+			item["value"] = *marker.Value
+		} else if marker.TextValue != "" {
+			item["value"] = marker.TextValue
+		}
+		if marker.ReferenceMin != nil {
+			item["reference_min"] = *marker.ReferenceMin
+		}
+		if marker.ReferenceMax != nil {
+			item["reference_max"] = *marker.ReferenceMax
+		}
+		compact = append(compact, item)
+	}
+	markerJSON, err := json.Marshal(compact)
+	if err != nil {
+		return domain.AIReview{}, err
+	}
+	var out struct {
+		AIReview domain.AIReview `json:"ai_review"`
+	}
+	system := "Ты медицинский модуль краткого резюме лабораторных результатов. Верни только JSON {ai_review:{summary,lifestyle:[],nutrition:[],doctor_needed,urgency,suggested_specialty}}. Summary: 2–4 понятных предложения только о содержании анализа и отклонениях, без диагноза и назначения препаратов. Учитывай возраст и ИМТ как контекст. Если есть значимые отклонения, укажи подходящую специальность врача. Не повторяй таблицу и не выдумывай данные."
+	if err = s.completeJSON(ctx, system, profileContext+"\nПоказатели: "+string(markerJSON), &out); err != nil {
+		return domain.AIReview{}, err
+	}
+	if strings.TrimSpace(out.AIReview.Summary) == "" {
+		return domain.AIReview{}, fmt.Errorf("deepseek returned empty review")
+	}
+	out.AIReview.Provider = "deepseek"
+	out.AIReview.Disclaimer = ruleReview(markers).Disclaimer
+	if out.AIReview.Lifestyle == nil {
+		out.AIReview.Lifestyle = []string{}
+	}
+	if out.AIReview.Nutrition == nil {
+		out.AIReview.Nutrition = []string{}
+	}
+	return out.AIReview, nil
 }
 
 type SymptomResult struct {
