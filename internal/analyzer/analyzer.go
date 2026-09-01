@@ -201,7 +201,15 @@ func (s *Service) extractImageDetailed(ctx context.Context, path string) (string
 	if strings.TrimSpace(primary) != "" {
 		candidates = append(candidates, primary)
 	}
-	if primaryErr != nil || len(parseMarkers(primary)) < 8 {
+	primaryMarkers := parseMarkers(primary)
+	primaryIncomplete := len(primaryMarkers) < 8
+	for _, marker := range primaryMarkers {
+		if marker.Value == nil || marker.Unit == "" || marker.ReferenceText == "" {
+			primaryIncomplete = true
+			break
+		}
+	}
+	if primaryErr != nil || primaryIncomplete {
 		fallback, fallbackErr := runPass("11")
 		if strings.TrimSpace(fallback) != "" {
 			candidates = append(candidates, fallback)
@@ -826,7 +834,7 @@ func (s *Service) deepSeek(ctx context.Context, text string, profile *domain.Pat
 	payload := map[string]any{
 		"model":           s.cfg.DeepSeekModel,
 		"temperature":     0.1,
-		"max_tokens":      4096,
+		"max_tokens":      2048,
 		"thinking":        map[string]string{"type": "disabled"},
 		"response_format": map[string]string{"type": "json_object"},
 		"messages":        []msg{{"system", "Ты медицинский модуль структурирования лабораторных бланков. Верни только json-объект: markers (поля name, canonical_name, value, text_value, unit, reference_min, reference_max, reference_text, status low|normal|high|unknown) и ai_review (summary, lifestyle[], nutrition[], doctor_needed, urgency routine|soon|urgent, suggested_specialty). Summary должен быть кратким и понятным пациенту, учитывать возраст и ИМТ, отмечать отклонения и при их наличии рекомендовать профиль специалиста. Не ставь диагноз, не назначай препараты, не выдумывай отсутствующие значения. ИМТ используй только как контекст, а не как диагноз."}, {"user", profileContext + "\n\nТекст бланка:\n" + text}},
