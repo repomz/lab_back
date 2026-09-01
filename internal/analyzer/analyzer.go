@@ -20,12 +20,16 @@ import (
 )
 
 type Service struct {
-	cfg    config.Config
-	client *http.Client
+	cfg      config.Config
+	client   *http.Client
+	ocrSlots chan struct{}
 }
 
 func New(cfg config.Config) *Service {
-	return &Service{cfg: cfg, client: &http.Client{Timeout: 60 * time.Second}}
+	// Two OCR jobs saturate the two-core production host. A bounded queue keeps
+	// additional uploads from starting more ImageMagick/Tesseract processes and
+	// degrading every in-flight request at once.
+	return &Service{cfg: cfg, client: &http.Client{Timeout: 60 * time.Second}, ocrSlots: make(chan struct{}, 2)}
 }
 
 func (s *Service) Process(ctx context.Context, path, mime string) (string, []domain.Marker, domain.AIReview, string) {
@@ -34,7 +38,13 @@ func (s *Service) Process(ctx context.Context, path, mime string) (string, []dom
 
 func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, profile *domain.PatientProfile) (string, []domain.Marker, domain.AIReview, string) {
 	started := time.Now()
+	select {
+	case s.ocrSlots <- struct{}{}:
+	case <-ctx.Done():
+		return "", []domain.Marker{}, failedReview(), "failed"
+	}
 	text, candidates, err := s.extract(ctx, path, mime)
+	<-s.ocrSlots
 	if err != nil {
 		log.Printf("recognition failed file=%s stage=ocr elapsed=%s error=%v", filepath.Base(path), time.Since(started).Round(time.Millisecond), err)
 		return "", []domain.Marker{}, failedReview(), "failed"

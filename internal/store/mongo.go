@@ -23,12 +23,30 @@ func Connect(ctx context.Context, uri, database string) (*Mongo, error) {
 		return nil, err
 	}
 	s := &Mongo{db: c.Database(database)}
-	_, err = s.db.Collection("users").Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)})
-	if err != nil {
-		return nil, err
+	indexes := []struct {
+		collection string
+		models     []mongo.IndexModel
+	}{
+		{"users", []mongo.IndexModel{{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)}}},
+		{"schedule_slots", []mongo.IndexModel{{Keys: bson.D{{Key: "doctor_id", Value: 1}, {Key: "start_at", Value: 1}}, Options: options.Index().SetUnique(true)}}},
+		{"analyses", []mongo.IndexModel{
+			{Keys: bson.D{{Key: "owner_id", Value: 1}, {Key: "created_at", Value: -1}}},
+			{Keys: bson.D{{Key: "shared_with", Value: 1}, {Key: "created_at", Value: -1}}},
+		}},
+		{"consultations", []mongo.IndexModel{
+			{Keys: bson.D{{Key: "patient_id", Value: 1}, {Key: "created_at", Value: -1}}},
+			{Keys: bson.D{{Key: "doctor_id", Value: 1}, {Key: "created_at", Value: -1}}},
+		}},
+		{"support_messages", []mongo.IndexModel{{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "created_at", Value: 1}}}}},
+		{"ai_chats", []mongo.IndexModel{{Keys: bson.D{{Key: "doctor_id", Value: 1}, {Key: "updated_at", Value: -1}}}}},
+		{"patient_notes", []mongo.IndexModel{{Keys: bson.D{{Key: "patient_id", Value: 1}, {Key: "created_at", Value: -1}}}}},
 	}
-	_, err = s.db.Collection("schedule_slots").Indexes().CreateOne(ctx, mongo.IndexModel{Keys: bson.D{{Key: "doctor_id", Value: 1}, {Key: "start_at", Value: 1}}, Options: options.Index().SetUnique(true)})
-	return s, err
+	for _, group := range indexes {
+		if _, err = s.db.Collection(group.collection).Indexes().CreateMany(ctx, group.models); err != nil {
+			return nil, err
+		}
+	}
+	return s, nil
 }
 func (s *Mongo) CreateUser(ctx context.Context, u *domain.User) error {
 	u.ID = primitive.NewObjectID()
