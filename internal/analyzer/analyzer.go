@@ -13,7 +13,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/repomz/lab_back/internal/config"
@@ -186,46 +185,35 @@ func (s *Service) extractImageDetailed(ctx context.Context, path string) (string
 		log.Printf("image preprocessing failed, using original: %v", preprocessErr)
 		ocrPath = path
 	}
-	type passResult struct {
-		index int
-		text  string
-		err   error
-	}
-	passes := []string{"4", "11"}
-	results := make([]passResult, len(passes))
-	var wg sync.WaitGroup
-	// PSM 4 лучше видит колонки, PSM 11 — разреженный текст
-	// на фотографиях с полями и печатями. Проходы независимы, поэтому их
-	// параллельный запуск почти вдвое сокращает OCR на многоядерном сервере.
-	for index, psm := range passes {
-		wg.Add(1)
-		go func(index int, psm string) {
-			defer wg.Done()
-			cmd := exec.CommandContext(ctx, "tesseract", ocrPath, "stdout", "-l", s.cfg.TesseractLang, "--psm", psm, "-c", "preserve_interword_spaces=1")
-			b, err := cmd.CombinedOutput()
-			if err != nil {
-				results[index] = passResult{index: index, err: fmt.Errorf("psm %s: %v: %s", psm, err, b)}
-				return
-			}
-			results[index] = passResult{index: index, text: string(b)}
-		}(index, psm)
-	}
-	wg.Wait()
-	var candidates []string
-	var lastErr error
-	for _, result := range results {
-		if result.err != nil {
-			lastErr = result.err
-			continue
+	runPass := func(psm string) (string, error) {
+		cmd := exec.CommandContext(ctx, "tesseract", ocrPath, "stdout", "-l", s.cfg.TesseractLang, "--psm", psm, "-c", "preserve_interword_spaces=1")
+		b, err := cmd.CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("psm %s: %v: %s", psm, err, b)
 		}
-		if strings.TrimSpace(result.text) != "" {
-			candidates = append(candidates, result.text)
+		return string(b), nil
+	}
+	// PSM 4 стабильно читает табличные лабораторные бланки. На небольшом
+	// production-сервере одновременные проходы конкурируют за CPU, поэтому
+	// дорогой PSM 11 запускаем только когда основной проход извлёк мало полей.
+	primary, primaryErr := runPass("4")
+	candidates := make([]string, 0, 2)
+	if strings.TrimSpace(primary) != "" {
+		candidates = append(candidates, primary)
+	}
+	if primaryErr != nil || len(parseMarkers(primary)) < 8 {
+		fallback, fallbackErr := runPass("11")
+		if strings.TrimSpace(fallback) != "" {
+			candidates = append(candidates, fallback)
+		}
+		if len(candidates) == 0 {
+			if fallbackErr != nil {
+				return "", nil, fallbackErr
+			}
+			return "", nil, primaryErr
 		}
 	}
 	if len(candidates) == 0 {
-		if lastErr != nil {
-			return "", nil, lastErr
-		}
 		return "", nil, fmt.Errorf("tesseract returned empty text")
 	}
 	best := candidates[0]
@@ -250,9 +238,9 @@ func preprocessImage(ctx context.Context, path string) (string, func(), error) {
 	cleanup := func() { _ = os.RemoveAll(tmpDir) }
 	outputPath := filepath.Join(tmpDir, "normalized.png")
 	// OCR does not benefit from 12+ MP phone photos, while processing time grows
-	// roughly with pixel count. 1800 px keeps small lab-table text readable and
+	// roughly with pixel count. 1600 px keeps small lab-table text readable and
 	// prevents a single upload from occupying the small production CPU too long.
-	cmd := exec.CommandContext(ctx, "magick", path, "-auto-orient", "-resize", "1800x1800>", "-colorspace", "Gray", "-deskew", "40%", "-contrast-stretch", "1%x1%", "-sharpen", "0x1", outputPath)
+	cmd := exec.CommandContext(ctx, "magick", path, "-auto-orient", "-resize", "1600x1600>", "-colorspace", "Gray", "-deskew", "40%", "-contrast-stretch", "1%x1%", "-sharpen", "0x1", outputPath)
 	if output, commandErr := cmd.CombinedOutput(); commandErr != nil {
 		cleanup()
 		return path, nil, fmt.Errorf("magick: %v: %s", commandErr, output)
