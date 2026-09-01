@@ -155,12 +155,8 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 		in.FullName = in.Email
 	}
 	role := domain.Role(in.Role)
-	if in.Email == "" || !validPIN(in.PIN) || (role != domain.RolePatient && role != domain.RoleDoctor) {
-		write(w, 422, map[string]string{"error": "логин, PIN и роль обязательны"})
-		return
-	}
-	if role == domain.RoleDoctor && strings.TrimSpace(in.Specialization) == "" {
-		write(w, 422, map[string]string{"error": "specialization is required for doctors"})
+	if in.Email == "" || !validPIN(in.PIN) || role != domain.RolePatient {
+		write(w, 422, map[string]string{"error": "регистрация доступна только пользователям; нужны логин и PIN из четырёх цифр"})
 		return
 	}
 	h, e := auth.Hash(in.PIN)

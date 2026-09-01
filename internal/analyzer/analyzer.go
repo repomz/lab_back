@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/repomz/lab_back/internal/config"
@@ -33,14 +34,20 @@ func (s *Service) Process(ctx context.Context, path, mime string) (string, []dom
 }
 
 func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, profile *domain.PatientProfile) (string, []domain.Marker, domain.AIReview, string) {
+	started := time.Now()
 	text, candidates, err := s.extract(ctx, path, mime)
 	if err != nil {
+		log.Printf("recognition failed file=%s stage=ocr elapsed=%s error=%v", filepath.Base(path), time.Since(started).Round(time.Millisecond), err)
 		return "", []domain.Marker{}, failedReview(), "failed"
 	}
+	ocrFinished := time.Now()
 	markers := parseOCRCandidates(candidates)
 	review := ruleReview(markers)
 	if s.cfg.DeepSeekAPIKey != "" && strings.TrimSpace(text) != "" {
-		if m, r, e := s.deepSeek(ctx, text, profile); e != nil {
+		aiCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+		m, r, e := s.deepSeek(aiCtx, text, profile)
+		cancel()
+		if e != nil {
 			log.Printf("deepseek structuring failed: %v", e)
 		} else if len(m) > 0 {
 			// An external language model may fill gaps, but it must never replace a
@@ -65,6 +72,7 @@ func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, prof
 		status = "needs_review"
 		review.Summary += " Часть полей распознана неуверенно — сверьте их с оригиналом."
 	}
+	log.Printf("recognition complete file=%s ocr=%s total=%s markers=%d status=%s", filepath.Base(path), ocrFinished.Sub(started).Round(time.Millisecond), time.Since(started).Round(time.Millisecond), len(markers), status)
 	return text, markers, review, status
 }
 
@@ -178,19 +186,40 @@ func (s *Service) extractImageDetailed(ctx context.Context, path string) (string
 		log.Printf("image preprocessing failed, using original: %v", preprocessErr)
 		ocrPath = path
 	}
+	type passResult struct {
+		index int
+		text  string
+		err   error
+	}
+	passes := []string{"4", "11"}
+	results := make([]passResult, len(passes))
+	var wg sync.WaitGroup
+	// PSM 4 лучше видит колонки, PSM 11 — разреженный текст
+	// на фотографиях с полями и печатями. Проходы независимы, поэтому их
+	// параллельный запуск почти вдвое сокращает OCR на многоядерном сервере.
+	for index, psm := range passes {
+		wg.Add(1)
+		go func(index int, psm string) {
+			defer wg.Done()
+			cmd := exec.CommandContext(ctx, "tesseract", ocrPath, "stdout", "-l", s.cfg.TesseractLang, "--psm", psm, "-c", "preserve_interword_spaces=1")
+			b, err := cmd.CombinedOutput()
+			if err != nil {
+				results[index] = passResult{index: index, err: fmt.Errorf("psm %s: %v: %s", psm, err, b)}
+				return
+			}
+			results[index] = passResult{index: index, text: string(b)}
+		}(index, psm)
+	}
+	wg.Wait()
 	var candidates []string
 	var lastErr error
-	// PSM 4 лучше видит колонки, PSM 11 — разреженный текст
-	// на фотографиях с полями и печатями.
-	for _, psm := range []string{"4", "11"} {
-		cmd := exec.CommandContext(ctx, "tesseract", ocrPath, "stdout", "-l", s.cfg.TesseractLang, "--psm", psm, "-c", "preserve_interword_spaces=1")
-		b, err := cmd.CombinedOutput()
-		if err != nil {
-			lastErr = fmt.Errorf("psm %s: %v: %s", psm, err, b)
+	for _, result := range results {
+		if result.err != nil {
+			lastErr = result.err
 			continue
 		}
-		if strings.TrimSpace(string(b)) != "" {
-			candidates = append(candidates, string(b))
+		if strings.TrimSpace(result.text) != "" {
+			candidates = append(candidates, result.text)
 		}
 	}
 	if len(candidates) == 0 {
