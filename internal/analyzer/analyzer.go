@@ -54,14 +54,7 @@ func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, prof
 	review := ruleReview(markers)
 	if s.cfg.DeepSeekAPIKey != "" && strings.TrimSpace(text) != "" {
 		aiCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		if len(markers) >= 3 {
-			r, e := s.deepSeekReview(aiCtx, markers, profile)
-			if e != nil {
-				log.Printf("deepseek review failed: %v", e)
-			} else {
-				review = r
-			}
-		} else {
+		if markersNeedStructuring(markers) {
 			m, r, e := s.deepSeek(aiCtx, text, profile)
 			if e != nil {
 				log.Printf("deepseek structuring failed: %v", e)
@@ -78,6 +71,13 @@ func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, prof
 			} else {
 				log.Printf("deepseek structuring returned no markers")
 			}
+		} else {
+			r, e := s.deepSeekReview(aiCtx, markers, profile)
+			if e != nil {
+				log.Printf("deepseek review failed: %v", e)
+			} else {
+				review = r
+			}
 		}
 		cancel()
 	}
@@ -91,6 +91,23 @@ func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, prof
 	}
 	log.Printf("recognition complete file=%s ocr=%s total=%s markers=%d status=%s review=%s", filepath.Base(path), ocrFinished.Sub(started).Round(time.Millisecond), time.Since(started).Round(time.Millisecond), len(markers), status, review.Provider)
 	return text, markers, review, status
+}
+
+// A laboratory sheet can contain dozens of rows. Finding three plausible rows
+// does not mean that the table is complete: the language model must still see
+// the OCR text when the local pass is sparse or any row lacks a trustworthy
+// value/reference. It may fill gaps, while mergeMarkerSets keeps strong local
+// values authoritative when the two recognizers disagree.
+func markersNeedStructuring(markers []domain.Marker) bool {
+	if len(markers) < 8 {
+		return true
+	}
+	for _, marker := range markers {
+		if marker.Value == nil || marker.Confidence < 0.8 || marker.Status == domain.StatusUnknown || marker.ReferenceText == "" {
+			return true
+		}
+	}
+	return false
 }
 
 func ClassifyAnalysis(markers []domain.Marker, text string) string {

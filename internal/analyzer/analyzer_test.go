@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
 	"github.com/repomz/lab_back/internal/config"
@@ -208,6 +209,49 @@ func TestExternalModelCannotOverrideConflictingLocalValue(t *testing.T) {
 	}
 	if merged[0].Confidence >= local[0].Confidence {
 		t.Fatal("a disagreement must lower confidence")
+	}
+}
+
+func TestSparseOrUncertainMarkersNeedDeepSeekStructuring(t *testing.T) {
+	value := 4.77
+	if !markersNeedStructuring([]domain.Marker{{Name: "Глюкоза", CanonicalName: "glucose", Value: &value, Confidence: 0.94, Status: domain.StatusNormal, ReferenceText: "3.9–6.4"}}) {
+		t.Fatal("a sparse table must be sent for structuring")
+	}
+	complete := make([]domain.Marker, 8)
+	for i := range complete {
+		complete[i] = domain.Marker{Name: "Показатель", CanonicalName: "marker", Value: &value, Confidence: 0.94, Status: domain.StatusNormal, ReferenceText: "1–10"}
+	}
+	if markersNeedStructuring(complete) {
+		t.Fatal("a complete trusted table only needs a review")
+	}
+	complete[3].Confidence = 0.62
+	if !markersNeedStructuring(complete) {
+		t.Fatal("an uncertain row must be sent for structuring")
+	}
+}
+
+func TestOCRPhotoFixture(t *testing.T) {
+	path := os.Getenv("LAB_OCR_FIXTURE")
+	if path == "" {
+		t.Skip("LAB_OCR_FIXTURE is not set")
+	}
+	service := New(config.Config{TesseractLang: "rus+eng"})
+	text, candidates, err := service.extract(context.Background(), path, "image/jpeg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	markers := parseOCRCandidates(candidates)
+	if len(markers) < 15 {
+		t.Fatalf("recognized only %d markers; OCR text: %.500s", len(markers), text)
+	}
+	byName := map[string]domain.Marker{}
+	for _, marker := range markers {
+		byName[marker.CanonicalName] = marker
+	}
+	for _, canonical := range []string{"glucose", "creatinine", "egfr", "uric_acid", "sodium"} {
+		if byName[canonical].Value == nil {
+			t.Fatalf("required marker %s is missing: %#v", canonical, markers)
+		}
 	}
 }
 
