@@ -176,6 +176,26 @@ type AIChat struct {
 	UpdatedAt time.Time          `bson:"updated_at" json:"updated_at"`
 }
 
+type ArticleBlock struct {
+	ID       string `bson:"id" json:"id"`
+	Type     string `bson:"type" json:"type"`
+	Text     string `bson:"text,omitempty" json:"text,omitempty"`
+	ImageURL string `bson:"image_url,omitempty" json:"image_url,omitempty"`
+	Caption  string `bson:"caption,omitempty" json:"caption,omitempty"`
+}
+
+type ClinicalArticle struct {
+	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	DoctorID  primitive.ObjectID `bson:"doctor_id,omitempty" json:"doctor_id,omitempty"`
+	Title     string             `bson:"title" json:"title"`
+	Summary   string             `bson:"summary" json:"summary"`
+	CoverURL  string             `bson:"cover_url" json:"cover_url"`
+	Published bool               `bson:"published" json:"published"`
+	Blocks    []ArticleBlock     `bson:"blocks" json:"blocks"`
+	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+	UpdatedAt time.Time          `bson:"updated_at" json:"updated_at"`
+}
+
 type Guide struct {
 	ID          string         `json:"id"`
 	Code        string         `json:"code,omitempty"`

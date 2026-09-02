@@ -40,11 +40,38 @@ func Connect(ctx context.Context, uri, database string) (*Mongo, error) {
 		{"support_messages", []mongo.IndexModel{{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "created_at", Value: 1}}}}},
 		{"ai_chats", []mongo.IndexModel{{Keys: bson.D{{Key: "doctor_id", Value: 1}, {Key: "updated_at", Value: -1}}}}},
 		{"patient_notes", []mongo.IndexModel{{Keys: bson.D{{Key: "patient_id", Value: 1}, {Key: "created_at", Value: -1}}}}},
+		{"clinical_articles", []mongo.IndexModel{{Keys: bson.D{{Key: "published", Value: -1}, {Key: "updated_at", Value: -1}}}}},
 	}
 	for _, group := range indexes {
 		if _, err = s.db.Collection(group.collection).Indexes().CreateMany(ctx, group.models); err != nil {
 			return nil, err
 		}
+	}
+	var seedMarker bson.M
+	seedErr := s.db.Collection("app_settings").FindOne(ctx, bson.M{"_id": "clinical_articles_seed_v1"}).Decode(&seedMarker)
+	if errors.Is(seedErr, mongo.ErrNoDocuments) {
+		seedID, _ := primitive.ObjectIDFromHex("66d000000000000000000001")
+		now := time.Now().UTC()
+		_, err = s.db.Collection("clinical_articles").UpdateOne(ctx, bson.M{"_id": seedID}, bson.M{"$setOnInsert": domain.ClinicalArticle{
+			ID: seedID, Title: "Сонные артерии: как атеросклероз влияет на кровоснабжение мозга",
+			Summary:  "Наглядный разбор формирования бляшки, стеноза сонной артерии и методов визуальной диагностики.",
+			CoverURL: "/clinical-carotid-overview.svg", Published: true, CreatedAt: now, UpdatedAt: now,
+			Blocks: []domain.ArticleBlock{
+				{ID: "intro", Type: "text", Text: "Сонные артерии доставляют кровь к головному мозгу. Атеросклеротическая бляшка чаще формируется в области бифуркации общей сонной артерии и постепенно сужает её просвет."},
+				{ID: "image", Type: "image", ImageURL: "/clinical-carotid-overview.svg", Caption: "Схема стеноза и ангиографическое представление сонной артерии."},
+				{ID: "symptoms", Type: "text", Text: "Транзиторная слабость в руке или ноге, асимметрия лица, внезапное нарушение речи или зрения требуют срочной медицинской оценки. Даже кратковременные симптомы могут быть проявлением транзиторной ишемической атаки."},
+				{ID: "diagnostics", Type: "text", Text: "Для первичной оценки обычно применяют ультразвуковое дуплексное сканирование. КТ-ангиография, МР-ангиография или рентгеноконтрастная ангиография помогают уточнить анатомию и степень сужения. Тактика всегда определяется врачом индивидуально."},
+			},
+		}}, options.Update().SetUpsert(true))
+		if err != nil {
+			return nil, err
+		}
+		_, err = s.db.Collection("app_settings").InsertOne(ctx, bson.M{"_id": "clinical_articles_seed_v1", "created_at": now})
+		if err != nil && !mongo.IsDuplicateKeyError(err) {
+			return nil, err
+		}
+	} else if seedErr != nil {
+		return nil, seedErr
 	}
 	return s, nil
 }
@@ -407,6 +434,55 @@ func (s *Mongo) AppendAIChat(ctx context.Context, id, doctor primitive.ObjectID,
 }
 func (s *Mongo) DeleteAIChat(ctx context.Context, id, doctor primitive.ObjectID) error {
 	r, err := s.db.Collection("ai_chats").DeleteOne(ctx, bson.M{"_id": id, "doctor_id": doctor})
+	if err == nil && r.DeletedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+
+func (s *Mongo) ClinicalArticles(ctx context.Context, includeDrafts bool) ([]domain.ClinicalArticle, error) {
+	filter := bson.M{}
+	if !includeDrafts {
+		filter["published"] = true
+	}
+	cur, err := s.db.Collection("clinical_articles").Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "updated_at", Value: -1}}))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []domain.ClinicalArticle
+	err = cur.All(ctx, &out)
+	return out, err
+}
+
+func (s *Mongo) ClinicalArticle(ctx context.Context, id primitive.ObjectID, includeDrafts bool) (domain.ClinicalArticle, error) {
+	filter := bson.M{"_id": id}
+	if !includeDrafts {
+		filter["published"] = true
+	}
+	var out domain.ClinicalArticle
+	err := s.db.Collection("clinical_articles").FindOne(ctx, filter).Decode(&out)
+	return out, err
+}
+
+func (s *Mongo) SaveClinicalArticle(ctx context.Context, article *domain.ClinicalArticle) error {
+	now := time.Now().UTC()
+	article.UpdatedAt = now
+	if article.ID.IsZero() {
+		article.ID = primitive.NewObjectID()
+		article.CreatedAt = now
+		_, err := s.db.Collection("clinical_articles").InsertOne(ctx, article)
+		return err
+	}
+	r, err := s.db.Collection("clinical_articles").UpdateOne(ctx, bson.M{"_id": article.ID}, bson.M{"$set": bson.M{"doctor_id": article.DoctorID, "title": article.Title, "summary": article.Summary, "cover_url": article.CoverURL, "published": article.Published, "blocks": article.Blocks, "updated_at": now}})
+	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+
+func (s *Mongo) DeleteClinicalArticle(ctx context.Context, id primitive.ObjectID) error {
+	r, err := s.db.Collection("clinical_articles").DeleteOne(ctx, bson.M{"_id": id})
 	if err == nil && r.DeletedCount == 0 {
 		return mongo.ErrNoDocuments
 	}

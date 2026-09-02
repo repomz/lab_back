@@ -43,6 +43,7 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, api.cors)
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ok"}) })
+	r.Get("/api/v1/articles/media/{name}", api.articleMedia)
 	r.Post("/api/v1/auth/register", api.register)
 	r.Post("/api/v1/auth/login", api.login)
 	r.Group(func(r chi.Router) {
@@ -84,6 +85,12 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Get("/api/v1/guides", api.guideList)
 		r.Get("/api/v1/guides/{id}", api.guideDetail)
 		r.Post("/api/v1/guides/sync", api.syncGuides)
+		r.Get("/api/v1/articles", api.articleList)
+		r.Get("/api/v1/articles/{id}", api.articleDetail)
+		r.Post("/api/v1/articles", api.createArticle)
+		r.Patch("/api/v1/articles/{id}", api.updateArticle)
+		r.Delete("/api/v1/articles/{id}", api.deleteArticle)
+		r.Post("/api/v1/articles/media", api.uploadArticleMedia)
 	})
 	return r
 }
@@ -1221,4 +1228,175 @@ func (a *API) syncGuides(w http.ResponseWriter, r *http.Request) {
 	}
 	items, synced, _ := a.guides.List(r.Context())
 	write(w, 200, map[string]any{"items": items, "synced_at": synced, "source": "Минздрав России"})
+}
+
+func (a *API) articleList(w http.ResponseWriter, r *http.Request) {
+	items, err := a.store.ClinicalArticles(r.Context(), current(r).Role == domain.RoleDoctor)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "could not load articles"})
+		return
+	}
+	write(w, 200, items)
+}
+
+func (a *API) articleDetail(w http.ResponseWriter, r *http.Request) {
+	id, err := primitive.ObjectIDFromHex(chi.URLParam(r, "id"))
+	if err != nil {
+		write(w, 400, map[string]string{"error": "invalid article id"})
+		return
+	}
+	item, err := a.store.ClinicalArticle(r.Context(), id, current(r).Role == domain.RoleDoctor)
+	if err != nil {
+		write(w, 404, map[string]string{"error": "article not found"})
+		return
+	}
+	write(w, 200, item)
+}
+
+func articleInput(r *http.Request) (domain.ClinicalArticle, error) {
+	var in domain.ClinicalArticle
+	if err := decode(r, &in); err != nil {
+		return in, err
+	}
+	in.Title = strings.TrimSpace(in.Title)
+	in.Summary = strings.TrimSpace(in.Summary)
+	in.CoverURL = strings.TrimSpace(in.CoverURL)
+	if in.Title == "" || len([]rune(in.Title)) > 180 || len(in.Blocks) > 30 {
+		return in, fmt.Errorf("invalid article")
+	}
+	for i := range in.Blocks {
+		if in.Blocks[i].ID == "" {
+			in.Blocks[i].ID = primitive.NewObjectID().Hex()
+		}
+		if in.Blocks[i].Type != "text" && in.Blocks[i].Type != "image" {
+			return in, fmt.Errorf("invalid block")
+		}
+		in.Blocks[i].Text = strings.TrimSpace(in.Blocks[i].Text)
+		in.Blocks[i].ImageURL = strings.TrimSpace(in.Blocks[i].ImageURL)
+		in.Blocks[i].Caption = strings.TrimSpace(in.Blocks[i].Caption)
+	}
+	return in, nil
+}
+
+func (a *API) createArticle(w http.ResponseWriter, r *http.Request) {
+	actor := current(r)
+	if actor.Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can publish articles"})
+		return
+	}
+	item, err := articleInput(r)
+	if err != nil {
+		write(w, 400, map[string]string{"error": "check article fields"})
+		return
+	}
+	item.ID = primitive.NilObjectID
+	item.DoctorID = actor.ID
+	if err = a.store.SaveClinicalArticle(r.Context(), &item); err != nil {
+		write(w, 500, map[string]string{"error": "could not save article"})
+		return
+	}
+	write(w, 201, item)
+}
+
+func (a *API) updateArticle(w http.ResponseWriter, r *http.Request) {
+	actor := current(r)
+	if actor.Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can edit articles"})
+		return
+	}
+	id, err := primitive.ObjectIDFromHex(chi.URLParam(r, "id"))
+	if err != nil {
+		write(w, 400, map[string]string{"error": "invalid article id"})
+		return
+	}
+	item, err := articleInput(r)
+	if err != nil {
+		write(w, 400, map[string]string{"error": "check article fields"})
+		return
+	}
+	item.ID = id
+	item.DoctorID = actor.ID
+	if err = a.store.SaveClinicalArticle(r.Context(), &item); err != nil {
+		write(w, 404, map[string]string{"error": "article not found"})
+		return
+	}
+	write(w, 200, item)
+}
+
+func (a *API) deleteArticle(w http.ResponseWriter, r *http.Request) {
+	if current(r).Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can delete articles"})
+		return
+	}
+	id, err := primitive.ObjectIDFromHex(chi.URLParam(r, "id"))
+	if err != nil {
+		write(w, 400, map[string]string{"error": "invalid article id"})
+		return
+	}
+	if err = a.store.DeleteClinicalArticle(r.Context(), id); err != nil {
+		write(w, 404, map[string]string{"error": "article not found"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *API) uploadArticleMedia(w http.ResponseWriter, r *http.Request) {
+	if current(r).Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors can upload article images"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, a.cfg.MaxUploadMB<<20)
+	if err := r.ParseMultipartForm(a.cfg.MaxUploadMB << 20); err != nil {
+		write(w, 400, map[string]string{"error": "image is too large"})
+		return
+	}
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		write(w, 400, map[string]string{"error": "image is required"})
+		return
+	}
+	defer file.Close()
+	buffer := make([]byte, 512)
+	n, _ := file.Read(buffer)
+	mime := http.DetectContentType(buffer[:n])
+	if mime != "image/jpeg" && mime != "image/png" && mime != "image/webp" {
+		write(w, 400, map[string]string{"error": "JPEG, PNG or WebP required"})
+		return
+	}
+	ext := map[string]string{"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[mime]
+	dir := filepath.Join(a.cfg.UploadDir, "article-media")
+	if err = os.MkdirAll(dir, 0o750); err != nil {
+		write(w, 500, map[string]string{"error": "could not prepare storage"})
+		return
+	}
+	name := primitive.NewObjectID().Hex() + ext
+	path := filepath.Join(dir, name)
+	out, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o640)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "could not save image"})
+		return
+	}
+	_, writeErr := out.Write(buffer[:n])
+	if writeErr == nil {
+		_, writeErr = io.Copy(out, file)
+	}
+	closeErr := out.Close()
+	if writeErr != nil || closeErr != nil {
+		_ = os.Remove(path)
+		write(w, 500, map[string]string{"error": "could not save image"})
+		return
+	}
+	_ = header
+	write(w, 201, map[string]string{"url": "/api/v1/articles/media/" + name})
+}
+
+func (a *API) articleMedia(w http.ResponseWriter, r *http.Request) {
+	name := filepath.Base(chi.URLParam(r, "name"))
+	if name == "." || name == "" || name != chi.URLParam(r, "name") {
+		http.NotFound(w, r)
+		return
+	}
+	path := filepath.Join(a.cfg.UploadDir, "article-media", name)
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	http.ServeFile(w, r, path)
 }
