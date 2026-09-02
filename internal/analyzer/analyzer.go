@@ -237,13 +237,10 @@ func (s *Service) extractImageDetailed(ctx context.Context, path string) (string
 		candidates = append(candidates, primary)
 	}
 	primaryMarkers := parseMarkers(primary)
+	// The sparse pass costs about as much as the primary OCR pass. It is useful
+	// when table mode loses whole rows, but not when a mostly complete table only
+	// has an uncertain reference: DeepSeek structuring handles that later.
 	primaryIncomplete := len(primaryMarkers) < 8
-	for _, marker := range primaryMarkers {
-		if marker.Value == nil || marker.Unit == "" || marker.ReferenceText == "" {
-			primaryIncomplete = true
-			break
-		}
-	}
 	if primaryErr != nil || primaryIncomplete {
 		fallback, fallbackErr := runPass("11")
 		if strings.TrimSpace(fallback) != "" {

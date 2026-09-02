@@ -102,15 +102,12 @@ func (s *Service) Sync(ctx context.Context) error {
 	for _, v := range envelope.Data {
 		specialties := []string{}
 		for _, speciality := range v.Specialities {
-			if speciality.ReferenceID == 42 || speciality.ReferenceID == 93 {
-				specialties = append(specialties, speciality.ReferenceName)
+			name := strings.ToLower(speciality.ReferenceName)
+			if strings.Contains(name, "кардиолог") {
+				specialties = append(specialties, "Кардиология")
 			}
-		}
-		cardiology := false
-		for _, m := range v.Mkbs {
-			if strings.HasPrefix(strings.ToUpper(m.MkbCode), "I") {
-				cardiology = true
-				break
+			if strings.Contains(name, "терап") || strings.Contains(name, "общая врачебная практика") {
+				specialties = append(specialties, "Терапия")
 			}
 		}
 		therapeuticText := strings.ToLower(v.Name)
@@ -118,9 +115,6 @@ func (s *Service) Sync(ctx context.Context) error {
 			therapeuticText += " " + strings.ToLower(d.NkoShortName)
 		}
 		therapy := strings.Contains(therapeuticText, "терапевт") || strings.Contains(therapeuticText, "внутренн") || strings.Contains(therapeuticText, "пневмони") || strings.Contains(therapeuticText, "бронхиальн") || strings.Contains(therapeuticText, "хроническая болезнь почек") || strings.Contains(therapeuticText, "сахарный диабет") || strings.Contains(therapeuticText, "железодефицит")
-		if cardiology {
-			specialties = append(specialties, "Кардиология")
-		}
 		if therapy {
 			specialties = append(specialties, "Терапия")
 		}
