@@ -83,7 +83,7 @@ func (s *Service) Sync(ctx context.Context) error {
 			Name, CodeVersion, PublishDateStr, AgeCategoryStr string
 			ApplyStatusCalculated                             int
 			Mkbs                                              []struct{ MkbCode string }
-			Developers                                        []struct{ NkoShortName string }
+			Developers                                        []struct{ NkoName, NkoShortName string }
 			Specialities                                      []struct {
 				ReferenceID   int    `json:"ReferenceId"`
 				ReferenceName string `json:"ReferenceName"`
@@ -98,6 +98,7 @@ func (s *Service) Sync(ctx context.Context) error {
 		return fmt.Errorf("empty minzdrav catalog")
 	}
 	items := make([]domain.Guide, 0, len(envelope.Data))
+	seenTitles := map[string]bool{}
 	now := time.Now().UTC()
 	for _, v := range envelope.Data {
 		specialties := []string{}
@@ -113,8 +114,13 @@ func (s *Service) Sync(ctx context.Context) error {
 		therapeuticText := strings.ToLower(v.Name)
 		for _, d := range v.Developers {
 			therapeuticText += " " + strings.ToLower(d.NkoShortName)
+			therapeuticText += " " + strings.ToLower(d.NkoName)
 		}
+		cardiology := isAdultCardiology(v.Name, v.Mkbs, therapeuticText)
 		therapy := strings.Contains(therapeuticText, "терапевт") || strings.Contains(therapeuticText, "внутренн") || strings.Contains(therapeuticText, "пневмони") || strings.Contains(therapeuticText, "бронхиальн") || strings.Contains(therapeuticText, "хроническая болезнь почек") || strings.Contains(therapeuticText, "сахарный диабет") || strings.Contains(therapeuticText, "железодефицит")
+		if cardiology {
+			specialties = append(specialties, "Кардиология")
+		}
 		if therapy {
 			specialties = append(specialties, "Терапия")
 		}
@@ -122,6 +128,13 @@ func (s *Service) Sync(ctx context.Context) error {
 		if len(specialties) == 0 || v.AgeCategoryStr != "Взрослые" {
 			continue
 		}
+		titleKey := strings.ToLower(strings.TrimSpace(v.Name))
+		// The official feed contains previous editions. It is sorted newest first,
+		// so expose only the current edition of each recommendation.
+		if seenTitles[titleKey] {
+			continue
+		}
+		seenTitles[titleKey] = true
 		codes := make([]string, 0, len(v.Mkbs))
 		for _, m := range v.Mkbs {
 			codes = append(codes, m.MkbCode)
@@ -144,6 +157,26 @@ func (s *Service) Sync(ctx context.Context) error {
 	s.synced = now
 	s.mu.Unlock()
 	return nil
+}
+
+func isAdultCardiology(title string, mkbs []struct{ MkbCode string }, searchable string) bool {
+	keywords := []string{"кардиолог", "сердц", "сердеч", "коронар", "инфаркт миокарда", "стенокард", "артериальная гипертенз", "фибрилляц", "аритми", "тахикард", "брадикард", "миокард", "перикард", "эндокард", "кардиомиопат", "клапан сердца", "дислипидем", "атеросклероз"}
+	text := strings.ToLower(title + " " + searchable)
+	for _, keyword := range keywords {
+		if strings.Contains(text, keyword) {
+			return true
+		}
+	}
+	for _, m := range mkbs {
+		code := strings.ToUpper(strings.TrimSpace(m.MkbCode))
+		if len(code) >= 3 && code[0] == 'I' {
+			major := code[1:3]
+			if major >= "10" && major <= "52" {
+				return true
+			}
+		}
+	}
+	return false
 }
 func uniqueStrings(values []string) []string {
 	seen := map[string]bool{}
