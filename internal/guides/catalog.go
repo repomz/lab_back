@@ -116,7 +116,7 @@ func (s *Service) Sync(ctx context.Context) error {
 			therapeuticText += " " + strings.ToLower(d.NkoShortName)
 			therapeuticText += " " + strings.ToLower(d.NkoName)
 		}
-		cardiology := isAdultCardiology(v.Name, v.Mkbs, therapeuticText)
+		cardiology := isAdultCardiology(v.Name, v.Mkbs)
 		therapy := strings.Contains(therapeuticText, "терапевт") || strings.Contains(therapeuticText, "внутренн") || strings.Contains(therapeuticText, "пневмони") || strings.Contains(therapeuticText, "бронхиальн") || strings.Contains(therapeuticText, "хроническая болезнь почек") || strings.Contains(therapeuticText, "сахарный диабет") || strings.Contains(therapeuticText, "железодефицит")
 		if cardiology {
 			specialties = append(specialties, "Кардиология")
@@ -159,9 +159,9 @@ func (s *Service) Sync(ctx context.Context) error {
 	return nil
 }
 
-func isAdultCardiology(title string, mkbs []struct{ MkbCode string }, searchable string) bool {
+func isAdultCardiology(title string, mkbs []struct{ MkbCode string }) bool {
 	keywords := []string{"кардиолог", "сердц", "сердеч", "коронар", "инфаркт миокарда", "стенокард", "артериальная гипертенз", "фибрилляц", "аритми", "тахикард", "брадикард", "миокард", "перикард", "эндокард", "кардиомиопат", "клапан сердца", "дислипидем", "атеросклероз"}
-	text := strings.ToLower(title + " " + searchable)
+	text := strings.ToLower(title)
 	for _, keyword := range keywords {
 		if strings.Contains(text, keyword) {
 			return true
