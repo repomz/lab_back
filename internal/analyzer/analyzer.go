@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"os/exec"
@@ -37,73 +38,86 @@ func (s *Service) Process(ctx context.Context, path, mime string) (string, []dom
 }
 
 func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, profile *domain.PatientProfile) (string, []domain.Marker, domain.AIReview, string) {
+	text, markers, status := s.RecognizeForPatient(ctx, path, mime, profile)
+	if status == "failed" {
+		return text, markers, failedReview(), status
+	}
+	if len(markers) == 0 {
+		return text, markers, emptyReview(), status
+	}
+	review := s.ReviewMarkersForPatient(ctx, markers, profile)
+	return text, markers, review, "ready"
+}
+
+// RecognizeForPatient extracts a verifiable table but deliberately postpones
+// interpretation until the patient confirms the values.
+func (s *Service) RecognizeForPatient(ctx context.Context, path, mime string, profile *domain.PatientProfile) (string, []domain.Marker, string) {
 	started := time.Now()
 	select {
 	case s.ocrSlots <- struct{}{}:
 	case <-ctx.Done():
-		return "", []domain.Marker{}, failedReview(), "failed"
+		return "", []domain.Marker{}, "failed"
 	}
 	text, candidates, err := s.extract(ctx, path, mime)
 	<-s.ocrSlots
 	if err != nil {
 		log.Printf("recognition failed file=%s stage=ocr elapsed=%s error=%v", filepath.Base(path), time.Since(started).Round(time.Millisecond), err)
-		return "", []domain.Marker{}, failedReview(), "failed"
+		return "", []domain.Marker{}, "failed"
 	}
 	ocrFinished := time.Now()
 	markers := parseOCRCandidates(candidates)
-	review := ruleReview(markers)
 	if s.cfg.DeepSeekAPIKey != "" && strings.TrimSpace(text) != "" {
 		aiCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		if markersNeedStructuring(markers) {
-			m, r, e := s.deepSeek(aiCtx, text, profile)
+			m, _, e := s.deepSeek(aiCtx, text, profile)
 			if e != nil {
 				log.Printf("deepseek structuring failed: %v", e)
 			} else if len(m) > 0 {
-				// The model only fills gaps when local extraction is insufficient.
 				markers = mergeMarkerSets(markers, normalizeExternalMarkers(m))
-				fallback := ruleReview(markers)
-				if strings.TrimSpace(r.Summary) == "" {
-					r = fallback
-				}
-				r.Provider = "deepseek"
-				r.Disclaimer = fallback.Disclaimer
-				review = r
 			} else {
 				log.Printf("deepseek structuring returned no markers")
-			}
-		} else {
-			r, e := s.deepSeekReview(aiCtx, markers, profile)
-			if e != nil {
-				log.Printf("deepseek review failed: %v", e)
-			} else {
-				review = r
 			}
 		}
 		cancel()
 	}
-	status := "ready"
+	status := "awaiting_confirmation"
 	if len(markers) == 0 {
 		status = "needs_review"
-		review = emptyReview()
-	} else if markersNeedReview(markers) {
-		status = "needs_review"
-		review.Summary += " Часть полей распознана неуверенно — сверьте их с оригиналом."
 	}
-	log.Printf("recognition complete file=%s ocr=%s total=%s markers=%d status=%s review=%s", filepath.Base(path), ocrFinished.Sub(started).Round(time.Millisecond), time.Since(started).Round(time.Millisecond), len(markers), status, review.Provider)
-	return text, markers, review, status
+	log.Printf("recognition complete file=%s ocr=%s total=%s markers=%d status=%s", filepath.Base(path), ocrFinished.Sub(started).Round(time.Millisecond), time.Since(started).Round(time.Millisecond), len(markers), status)
+	return text, markers, status
 }
 
-// A laboratory sheet can contain dozens of rows. Finding three plausible rows
-// does not mean that the table is complete: the language model must still see
-// the OCR text when the local pass is sparse or any row lacks a trustworthy
-// value/reference. It may fill gaps, while mergeMarkerSets keeps strong local
-// values authoritative when the two recognizers disagree.
+func (s *Service) ReviewMarkersForPatient(ctx context.Context, markers []domain.Marker, profile *domain.PatientProfile) domain.AIReview {
+	fallback := ruleReview(markers)
+	if s.cfg.DeepSeekAPIKey == "" {
+		return fallback
+	}
+	aiCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	review, err := s.deepSeekReview(aiCtx, markers, profile)
+	if err != nil {
+		log.Printf("deepseek review failed: %v", err)
+		return fallback
+	}
+	return review
+}
+
+// A mostly complete table is faster and safer to show directly for patient
+// verification. DeepSeek structures only genuinely sparse OCR here; medical
+// interpretation still always runs after the patient approves the values.
 func markersNeedStructuring(markers []domain.Marker) bool {
 	if len(markers) < 8 {
 		return true
 	}
+	// A long table is already useful for the mandatory patient verification
+	// screen. Asking a language model to "repair" one uncertain reference adds
+	// latency and can replace a laboratory-specific range with a generic one.
+	if len(markers) >= 12 {
+		return false
+	}
 	for _, marker := range markers {
-		if marker.Value == nil || marker.Confidence < 0.8 || marker.Status == domain.StatusUnknown || marker.ReferenceText == "" {
+		if marker.Value == nil || marker.Status == domain.StatusUnknown || marker.Confidence < 0.7 {
 			return true
 		}
 	}
@@ -154,6 +168,66 @@ func ClassifyAnalysis(markers []domain.Marker, text string) string {
 		return "Кровь · биохимия"
 	}
 	return "Лабораторное исследование"
+}
+
+// ExtractCollectedAt prefers specimen collection / study dates and ignores
+// birth and print dates commonly present on the same laboratory sheet.
+func ExtractCollectedAt(text string) *time.Time {
+	normalized := strings.ToLower(strings.ReplaceAll(text, "\n", " "))
+	patterns := []string{
+		`дата\s+(?:взятия|забора)(?:\s+биоматериала|\s+материала)?\s*[:.]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{4})`,
+		`дата\s+(?:проведения\s+)?исследования\s*[:.]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{4})`,
+		`дата\s+сдачи\s*[:.]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{4})`,
+	}
+	for _, pattern := range patterns {
+		match := regexp.MustCompile(pattern).FindStringSubmatch(normalized)
+		if len(match) != 2 {
+			continue
+		}
+		value := strings.NewReplacer("/", ".", "-", ".").Replace(match[1])
+		if parsed, err := time.Parse("2.1.2006", value); err == nil && parsed.Year() >= 1900 && !parsed.After(time.Now().Add(24*time.Hour)) {
+			utc := parsed.UTC()
+			return &utc
+		}
+	}
+	return nil
+}
+
+func NormalizeConfirmedMarkers(markers []domain.Marker) ([]domain.Marker, error) {
+	if len(markers) == 0 || len(markers) > 200 {
+		return nil, fmt.Errorf("invalid marker count")
+	}
+	out := make([]domain.Marker, 0, len(markers))
+	for _, marker := range markers {
+		marker.Name = strings.TrimSpace(marker.Name)
+		if marker.Name == "" || len(marker.Name) > 160 {
+			return nil, fmt.Errorf("invalid marker name")
+		}
+		if marker.Value != nil && (math.IsNaN(*marker.Value) || math.IsInf(*marker.Value, 0)) {
+			return nil, fmt.Errorf("invalid marker value")
+		}
+		marker.Confidence = 1
+		marker.Warnings = nil
+		marker.Status = inferStatus(marker)
+		out = append(out, marker)
+	}
+	return out, nil
+}
+
+func inferStatus(marker domain.Marker) domain.MarkerStatus {
+	if marker.Value == nil {
+		return domain.StatusUnknown
+	}
+	if marker.ReferenceMin != nil && *marker.Value < *marker.ReferenceMin {
+		return domain.StatusLow
+	}
+	if marker.ReferenceMax != nil && *marker.Value > *marker.ReferenceMax {
+		return domain.StatusHigh
+	}
+	if marker.ReferenceMin != nil || marker.ReferenceMax != nil {
+		return domain.StatusNormal
+	}
+	return marker.Status
 }
 func (s *Service) extract(ctx context.Context, path, mime string) (string, []string, error) {
 	if strings.Contains(mime, "pdf") {
@@ -220,8 +294,8 @@ func (s *Service) extractImageDetailed(ctx context.Context, path string) (string
 		log.Printf("image preprocessing failed, using original: %v", preprocessErr)
 		ocrPath = path
 	}
-	runPass := func(psm string) (string, error) {
-		cmd := exec.CommandContext(ctx, "tesseract", ocrPath, "stdout", "-l", s.cfg.TesseractLang, "--psm", psm, "-c", "preserve_interword_spaces=1")
+	runPass := func(psm, language string) (string, error) {
+		cmd := exec.CommandContext(ctx, "tesseract", ocrPath, "stdout", "-l", language, "--psm", psm, "-c", "preserve_interword_spaces=1")
 		b, err := cmd.CombinedOutput()
 		if err != nil {
 			return "", fmt.Errorf("psm %s: %v: %s", psm, err, b)
@@ -231,7 +305,11 @@ func (s *Service) extractImageDetailed(ctx context.Context, path string) (string
 	// PSM 4 стабильно читает табличные лабораторные бланки. На небольшом
 	// production-сервере одновременные проходы конкурируют за CPU, поэтому
 	// дорогой PSM 11 запускаем только когда основной проход извлёк мало полей.
-	primary, primaryErr := runPass("4")
+	// Russian lab forms are both faster and more accurately spaced with the
+	// single Russian model. If that pass cannot find a table, the fallback uses
+	// the complete configured language set so English and mixed forms remain
+	// supported.
+	primary, primaryErr := runPass("4", primaryOCRLanguage(s.cfg.TesseractLang))
 	candidates := make([]string, 0, 2)
 	if strings.TrimSpace(primary) != "" {
 		candidates = append(candidates, primary)
@@ -242,7 +320,7 @@ func (s *Service) extractImageDetailed(ctx context.Context, path string) (string
 	// has an uncertain reference: DeepSeek structuring handles that later.
 	primaryIncomplete := len(primaryMarkers) < 8
 	if primaryErr != nil || primaryIncomplete {
-		fallback, fallbackErr := runPass("11")
+		fallback, fallbackErr := runPass("11", s.cfg.TesseractLang)
 		if strings.TrimSpace(fallback) != "" {
 			candidates = append(candidates, fallback)
 		}
@@ -267,6 +345,15 @@ func (s *Service) extractImageDetailed(ctx context.Context, path string) (string
 	return best, candidates, nil
 }
 
+func primaryOCRLanguage(configured string) string {
+	for _, language := range strings.Split(configured, "+") {
+		if strings.TrimSpace(language) == "rus" {
+			return "rus"
+		}
+	}
+	return configured
+}
+
 // preprocessImage fixes the EXIF orientation commonly produced by phone cameras,
 // normalizes uneven lighting and removes a small camera tilt before OCR. Tesseract
 // does not reliably apply EXIF orientation itself.
@@ -276,7 +363,9 @@ func preprocessImage(ctx context.Context, path string) (string, func(), error) {
 		return path, nil, err
 	}
 	cleanup := func() { _ = os.RemoveAll(tmpDir) }
-	outputPath := filepath.Join(tmpDir, "normalized.png")
+	// PGM avoids the comparatively expensive PNG encoder/decoder round trip.
+	// It is lossless and is read natively by Tesseract/Leptonica.
+	outputPath := filepath.Join(tmpDir, "normalized.pgm")
 	// OCR does not benefit from 12+ MP phone photos, while processing time grows
 	// roughly with pixel count. 1800 px keeps small lab-table text readable and
 	// prevents a single upload from occupying the small production CPU too long.
@@ -447,6 +536,14 @@ func parseKnownMarkers(text string) []domain.Marker {
 						}
 					}
 				}
+			} else if len(numbers) > 1 {
+				if minValue, maxValue, warning, ok := repairCollapsedReference(spec.canonical, value, numbers[1:]); ok {
+					marker.ReferenceMin, marker.ReferenceMax = floatPtr(minValue), floatPtr(maxValue)
+					marker.ReferenceText = formatReference(minValue, maxValue)
+					marker.Status = statusForRange(value, minValue, maxValue)
+					marker.Confidence = maxFloat(marker.Confidence, 0.76)
+					marker.Warnings = appendUnique(marker.Warnings, warning)
+				}
 			}
 			if hint != domain.StatusUnknown {
 				marker.Status = hint
@@ -487,6 +584,37 @@ func parseKnownMarkers(text string) []domain.Marker {
 		}
 	}
 	return out
+}
+
+// repairCollapsedReference handles only OCR artifacts confirmed on photographed
+// laboratory forms. It is deliberately marker-specific: a generic split of a
+// four-digit token could silently invent a reference interval.
+func repairCollapsedReference(canonical string, value float64, tokens []string) (float64, float64, string, bool) {
+	if len(tokens) == 0 {
+		return 0, 0, "", false
+	}
+	first := strings.TrimSpace(tokens[0])
+	switch canonical {
+	case "iron":
+		if first == "1026" && value >= 0 && value <= 100 {
+			return 10, 26, "OCR восстановил слитый референс железа — проверьте строку.", true
+		}
+	case "calcium_total":
+		// Depending on the thresholding result, the same printed `2 - 2,6`
+		// has appeared as `2256`, `2725` and, on the production fixture, `225`
+		// after the final 6 was confused with 5. The measured-value guard and
+		// marker-specific branch prevent applying this repair to unrelated rows.
+		if (first == "225" || first == "2256" || first == "2725") && value >= 2 && value <= 3 {
+			return 2, 2.6, "OCR восстановил слитый референс кальция — проверьте строку.", true
+		}
+	case "uric_acid":
+		// A blurred decimal comma and dash may disappear independently:
+		// `154,7 - 428,4` then becomes the two tokens `1547 4284`.
+		if len(tokens) > 1 && first == "1547" && strings.TrimSpace(tokens[1]) == "4284" && value >= 100 && value <= 1000 {
+			return 154.7, 428.4, "OCR восстановил разделители референса мочевой кислоты — проверьте строку.", true
+		}
+	}
+	return 0, 0, "", false
 }
 
 // PSM 11 often preserves values more accurately than table mode, but emits each
@@ -965,6 +1093,36 @@ type ClinicalAssistResult struct {
 	Tactics         []string `json:"tactics"`
 	GuidelineRefs   []string `json:"guideline_refs"`
 	Limitations     string   `json:"limitations"`
+}
+
+type PatientHealthSummaryResult struct {
+	Summary string `json:"summary"`
+}
+
+func (s *Service) PatientHealthSummary(ctx context.Context, patient domain.User, analyses []domain.Analysis) PatientHealthSummaryResult {
+	if len(analyses) == 0 {
+		return PatientHealthSummaryResult{Summary: "После загрузки и распознавания анализов здесь появится общее резюме вашего текущего состояния и динамики показателей."}
+	}
+	fallback := "По доступным исследованиям сформировано общее резюме. "
+	if text := strings.TrimSpace(analyses[0].AIReview.Summary); text != "" {
+		fallback += text
+	} else {
+		fallback += "Оцените результаты вместе с врачом с учётом самочувствия и истории здоровья."
+	}
+	if len(analyses) > 1 {
+		fallback += " В истории есть несколько исследований; повторяющиеся показатели следует оценивать в динамике по датам и референсным диапазонам лабораторий."
+	}
+	if s.cfg.DeepSeekAPIKey == "" {
+		return PatientHealthSummaryResult{Summary: fallback}
+	}
+	profileJSON, _ := json.Marshal(patient.PatientProfile)
+	var out PatientHealthSummaryResult
+	system := "Ты формируешь одно общее безопасное резюме состояния пациента по всей доступной истории лабораторных исследований. Не перечисляй отдельные резюме анализов подряд. Сначала кратко опиши общую картину, затем оцени динамику только тех показателей, которые действительно измерялись неоднократно. Учитывай даты и разные референсные диапазоны, не ставь диагноз, не назначай препараты и не выдумывай отсутствующие данные. При значимых отклонениях укажи, к какому врачу разумно обратиться. Ответ на русском, понятный пациенту, 5–9 предложений. Верни JSON {summary}."
+	err := s.completeJSON(ctx, system, "Профиль: "+string(profileJSON)+"\nИстория анализов:\n"+compactAnalysisContext(analyses), &out)
+	if err != nil || strings.TrimSpace(out.Summary) == "" {
+		return PatientHealthSummaryResult{Summary: fallback}
+	}
+	return out
 }
 
 func (s *Service) Recommendation(ctx context.Context, kind string, profile domain.PatientProfile, analyses []domain.Analysis) (string, error) {

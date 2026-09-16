@@ -11,26 +11,59 @@ type Role string
 const (
 	RolePatient Role = "patient"
 	RoleDoctor  Role = "doctor"
+	RoleAdmin   Role = "admin"
 )
 
+type DoctorProfile struct {
+	About        string   `bson:"about,omitempty" json:"about,omitempty"`
+	Experience   []string `bson:"experience,omitempty" json:"experience,omitempty"`
+	Services     []string `bson:"services,omitempty" json:"services,omitempty"`
+	Workplace    string   `bson:"workplace,omitempty" json:"workplace,omitempty"`
+	ScheduleStep int      `bson:"schedule_step,omitempty" json:"schedule_step,omitempty"`
+	VisibleDays  int      `bson:"visible_days,omitempty" json:"visible_days,omitempty"`
+}
+
 type User struct {
-	ID                 primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	Email              string             `bson:"email" json:"email"`
-	PasswordHash       string             `bson:"password_hash" json:"-"`
-	Role               Role               `bson:"role" json:"role"`
-	FullName           string             `bson:"full_name" json:"full_name"`
-	Phone              string             `bson:"phone,omitempty" json:"phone,omitempty"`
-	ResidentialAddress string             `bson:"residential_address,omitempty" json:"residential_address,omitempty"`
-	Specialization     string             `bson:"specialization,omitempty" json:"specialization,omitempty"`
-	LicenseNumber      string             `bson:"license_number,omitempty" json:"license_number,omitempty"`
-	Verified           bool               `bson:"verified" json:"verified"`
-	PatientProfile     *PatientProfile    `bson:"patient_profile,omitempty" json:"patient_profile,omitempty"`
-	HomeVisits         bool               `bson:"home_visits,omitempty" json:"home_visits,omitempty"`
-	AppointmentSlots   []time.Time        `bson:"appointment_slots,omitempty" json:"appointment_slots,omitempty"`
-	AvatarPath         string             `bson:"avatar_path,omitempty" json:"-"`
-	AvatarPreset       string             `bson:"avatar_preset,omitempty" json:"avatar_preset,omitempty"`
-	AvatarUpdatedAt    *time.Time         `bson:"avatar_updated_at,omitempty" json:"avatar_updated_at,omitempty"`
-	CreatedAt          time.Time          `bson:"created_at" json:"created_at"`
+	ID                   primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	Email                string             `bson:"email" json:"email"`
+	PasswordHash         string             `bson:"password_hash" json:"-"`
+	Role                 Role               `bson:"role" json:"role"`
+	FullName             string             `bson:"full_name" json:"full_name"`
+	BirthDate            string             `bson:"birth_date,omitempty" json:"birth_date,omitempty"`
+	Gender               string             `bson:"gender,omitempty" json:"gender,omitempty"`
+	ContactEmail         string             `bson:"contact_email,omitempty" json:"contact_email,omitempty"`
+	Phone                string             `bson:"phone,omitempty" json:"phone,omitempty"`
+	ResidentialAddress   string             `bson:"residential_address,omitempty" json:"residential_address,omitempty"`
+	City                 string             `bson:"city,omitempty" json:"city,omitempty"`
+	Specialization       string             `bson:"specialization,omitempty" json:"specialization,omitempty"`
+	LicenseNumber        string             `bson:"license_number,omitempty" json:"license_number,omitempty"`
+	Verified             bool               `bson:"verified" json:"verified"`
+	IsDeveloper          bool               `bson:"is_developer,omitempty" json:"is_developer,omitempty"`
+	DevDataTTLHours      int                `bson:"dev_data_ttl_hours,omitempty" json:"dev_data_ttl_hours,omitempty"`
+	PatientProfile       *PatientProfile    `bson:"patient_profile,omitempty" json:"patient_profile,omitempty"`
+	DoctorProfile        *DoctorProfile     `bson:"doctor_profile,omitempty" json:"doctor_profile,omitempty"`
+	OnlineClinic         bool               `bson:"online_clinic,omitempty" json:"online_clinic,omitempty"`
+	HomeVisits           bool               `bson:"home_visits,omitempty" json:"home_visits,omitempty"`
+	AppointmentSlots     []time.Time        `bson:"appointment_slots,omitempty" json:"appointment_slots,omitempty"`
+	AvatarPath           string             `bson:"avatar_path,omitempty" json:"-"`
+	AvatarPreset         string             `bson:"avatar_preset,omitempty" json:"avatar_preset,omitempty"`
+	AvatarUpdatedAt      *time.Time         `bson:"avatar_updated_at,omitempty" json:"avatar_updated_at,omitempty"`
+	DeletionRequestedAt  *time.Time         `bson:"deletion_requested_at,omitempty" json:"deletion_requested_at,omitempty"`
+	DeletionScheduledFor *time.Time         `bson:"deletion_scheduled_for,omitempty" json:"deletion_scheduled_for,omitempty"`
+	CreatedAt            time.Time          `bson:"created_at" json:"created_at"`
+}
+
+type AppStats struct {
+	TotalUsers         int64 `json:"total_users"`
+	NewUsers           int64 `json:"new_users"`
+	Logins             int64 `json:"logins"`
+	UploadedTests      int64 `json:"uploaded_tests"`
+	TotalUploadedTests int64 `json:"total_uploaded_tests"`
+	TotalDoctors       int64 `json:"total_doctors"`
+	Consultations24h   int64 `json:"consultations_24h"`
+	Appointments24h    int64 `json:"appointments_24h"`
+	SupportMessages24h int64 `json:"support_messages_24h"`
+	AIRequests24h      int64 `json:"ai_requests_24h"`
 }
 
 type ActivitySurvey struct {
@@ -50,6 +83,7 @@ type NutritionSurvey struct {
 
 type PatientProfile struct {
 	Age                     int             `bson:"age" json:"age"`
+	BirthDate               string          `bson:"birth_date,omitempty" json:"birth_date,omitempty"`
 	HeightCM                float64         `bson:"height_cm" json:"height_cm"`
 	WeightKG                float64         `bson:"weight_kg" json:"weight_kg"`
 	BMI                     float64         `bson:"bmi" json:"bmi"`
@@ -111,33 +145,43 @@ type Analysis struct {
 	SharedWith   []primitive.ObjectID `bson:"shared_with" json:"shared_with"`
 	CreatedAt    time.Time            `bson:"created_at" json:"created_at"`
 	UpdatedAt    time.Time            `bson:"updated_at" json:"updated_at"`
+	IsDeveloper  bool                 `bson:"is_developer,omitempty" json:"is_developer,omitempty"`
 }
 
 type Consultation struct {
-	ID                  primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	AnalysisID          primitive.ObjectID `bson:"analysis_id,omitempty" json:"analysis_id,omitempty"`
-	PatientID           primitive.ObjectID `bson:"patient_id" json:"patient_id"`
-	DoctorID            primitive.ObjectID `bson:"doctor_id,omitempty" json:"doctor_id,omitempty"`
-	Source              string             `bson:"source" json:"source"`
-	Title               string             `bson:"title" json:"title"`
-	Specialty           string             `bson:"specialty,omitempty" json:"specialty,omitempty"`
-	ServiceType         string             `bson:"service_type,omitempty" json:"service_type,omitempty"`
-	AppointmentAt       *time.Time         `bson:"appointment_at,omitempty" json:"appointment_at,omitempty"`
-	PersonalDataConsent bool               `bson:"personal_data_consent" json:"personal_data_consent"`
-	MedicalDataConsent  bool               `bson:"medical_data_consent" json:"medical_data_consent"`
-	Question            string             `bson:"question" json:"question"`
-	Reply               string             `bson:"reply,omitempty" json:"reply,omitempty"`
-	Status              string             `bson:"status" json:"status"`
-	CreatedAt           time.Time          `bson:"created_at" json:"created_at"`
-	UpdatedAt           time.Time          `bson:"updated_at" json:"updated_at"`
+	ID                  primitive.ObjectID    `bson:"_id,omitempty" json:"id"`
+	AnalysisID          primitive.ObjectID    `bson:"analysis_id,omitempty" json:"analysis_id,omitempty"`
+	PatientID           primitive.ObjectID    `bson:"patient_id" json:"patient_id"`
+	PatientName         string                `bson:"-" json:"patient_name,omitempty"`
+	DoctorID            primitive.ObjectID    `bson:"doctor_id,omitempty" json:"doctor_id,omitempty"`
+	Source              string                `bson:"source" json:"source"`
+	Title               string                `bson:"title" json:"title"`
+	Specialty           string                `bson:"specialty,omitempty" json:"specialty,omitempty"`
+	ServiceType         string                `bson:"service_type,omitempty" json:"service_type,omitempty"`
+	AppointmentAt       *time.Time            `bson:"appointment_at,omitempty" json:"appointment_at,omitempty"`
+	PersonalDataConsent bool                  `bson:"personal_data_consent" json:"personal_data_consent"`
+	MedicalDataConsent  bool                  `bson:"medical_data_consent" json:"medical_data_consent"`
+	Question            string                `bson:"question" json:"question"`
+	Reply               string                `bson:"reply,omitempty" json:"reply,omitempty"`
+	Messages            []ConsultationMessage `bson:"messages,omitempty" json:"messages,omitempty"`
+	Status              string                `bson:"status" json:"status"`
+	CreatedAt           time.Time             `bson:"created_at" json:"created_at"`
+	UpdatedAt           time.Time             `bson:"updated_at" json:"updated_at"`
+}
+
+type ConsultationMessage struct {
+	Sender    string    `bson:"sender" json:"sender"`
+	Text      string    `bson:"text" json:"text"`
+	CreatedAt time.Time `bson:"created_at" json:"created_at"`
 }
 
 type SupportMessage struct {
-	ID        primitive.ObjectID `bson:"_id,omitempty" json:"id"`
-	UserID    primitive.ObjectID `bson:"user_id" json:"user_id"`
-	Sender    string             `bson:"sender" json:"sender"`
-	Text      string             `bson:"text" json:"text"`
-	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
+	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
+	UserID      primitive.ObjectID `bson:"user_id" json:"user_id"`
+	PatientName string             `bson:"-" json:"patient_name,omitempty"`
+	Sender      string             `bson:"sender" json:"sender"`
+	Text        string             `bson:"text" json:"text"`
+	CreatedAt   time.Time          `bson:"created_at" json:"created_at"`
 }
 
 type ScheduleSlot struct {
@@ -194,24 +238,4 @@ type ClinicalArticle struct {
 	Blocks    []ArticleBlock     `bson:"blocks" json:"blocks"`
 	CreatedAt time.Time          `bson:"created_at" json:"created_at"`
 	UpdatedAt time.Time          `bson:"updated_at" json:"updated_at"`
-}
-
-type Guide struct {
-	ID          string         `json:"id"`
-	Code        string         `json:"code,omitempty"`
-	Title       string         `json:"title"`
-	Category    string         `json:"category,omitempty"`
-	Status      string         `json:"status,omitempty"`
-	Developers  []string       `json:"developers,omitempty"`
-	Specialties []string       `json:"specialties,omitempty"`
-	PublishedAt time.Time      `json:"published_at,omitempty"`
-	SourceURL   string         `json:"source_url"`
-	Sections    []GuideSection `json:"sections,omitempty"`
-	UpdatedAt   time.Time      `json:"updated_at"`
-}
-
-type GuideSection struct {
-	ID      string `json:"id"`
-	Title   string `json:"title"`
-	Content string `json:"content"`
 }

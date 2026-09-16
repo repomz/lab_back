@@ -66,10 +66,11 @@ func buildAnalysisPDF(item domain.Analysis) ([]byte, error) {
 	pdf.MultiCell(178, 7, item.Title, "", "L", false)
 	pdf.SetFont("Lab", "", 9)
 	pdf.SetTextColor(92, 101, 118)
-	pdf.CellFormat(178, 6, "Дата загрузки: "+item.CreatedAt.Local().Format("02.01.2006 15:04"), "", 1, "L", false, 0, "")
+	studyDate := item.CreatedAt.Local().Format("02.01.2006")
 	if item.CollectedAt != nil {
-		pdf.CellFormat(178, 6, "Дата исследования: "+item.CollectedAt.Local().Format("02.01.2006"), "", 1, "L", false, 0, "")
+		studyDate = item.CollectedAt.Local().Format("02.01.2006")
 	}
+	pdf.CellFormat(178, 6, "Дата исследования: "+studyDate, "", 1, "L", false, 0, "")
 	pdf.Ln(4)
 
 	widths := []float64{66, 35, 45, 32}

@@ -18,7 +18,6 @@ import (
 	"github.com/repomz/lab_back/internal/auth"
 	"github.com/repomz/lab_back/internal/config"
 	"github.com/repomz/lab_back/internal/domain"
-	"github.com/repomz/lab_back/internal/guides"
 	"github.com/repomz/lab_back/internal/store"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -28,7 +27,6 @@ type API struct {
 	cfg      config.Config
 	store    *store.Mongo
 	analyzer *analyzer.Service
-	guides   *guides.Service
 }
 type actor struct {
 	ID   primitive.ObjectID
@@ -39,7 +37,7 @@ type contextKey string
 const actorKey contextKey = "actor"
 
 func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
-	api := &API{cfg: cfg, store: s, analyzer: a, guides: guides.New()}
+	api := &API{cfg: cfg, store: s, analyzer: a}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, api.cors)
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ok"}) })
@@ -49,25 +47,34 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(api.authorize)
 		r.Get("/api/v1/me", api.me)
+		r.Post("/api/v1/me/deletion-request", api.requestAccountDeletion)
+		r.Delete("/api/v1/me/deletion-request", api.cancelAccountDeletion)
 		r.Patch("/api/v1/me/contact-profile", api.updateContactProfile)
 		r.Patch("/api/v1/me/patient-profile", api.updatePatientProfile)
+		r.Patch("/api/v1/me/doctor-profile", api.updateDoctorProfile)
+		r.Patch("/api/v1/me/settings", api.updateSettings)
 		r.Post("/api/v1/me/avatar", api.uploadAvatar)
 		r.Patch("/api/v1/me/avatar-preset", api.avatarPreset)
 		r.Get("/api/v1/users/{id}/avatar", api.avatar)
 		r.Get("/api/v1/doctors", api.doctors)
 		r.Get("/api/v1/patients", api.patients)
+		r.Get("/api/v1/admin/stats", api.appStats)
+		r.Post("/api/v1/admin/impersonate", api.adminImpersonate)
 		r.Get("/api/v1/analyses", api.analyses)
+		r.Get("/api/v1/me/health-summary", api.healthSummary)
 		r.Post("/api/v1/analyses", api.upload)
 		r.Get("/api/v1/analyses/{id}", api.analysis)
 		r.Get("/api/v1/analyses/{id}/file", api.file)
 		r.Get("/api/v1/analyses/{id}/report.pdf", api.reportPDF)
 		r.Delete("/api/v1/analyses/{id}", api.deleteAnalysis)
 		r.Post("/api/v1/analyses/{id}/reprocess", api.reprocess)
+		r.Post("/api/v1/analyses/{id}/confirm", api.confirmAnalysis)
 		r.Post("/api/v1/analyses/{id}/share", api.share)
 		r.Get("/api/v1/consultations", api.consultations)
 		r.Post("/api/v1/consultations", api.createConsultation)
 		r.Post("/api/v1/consultations/ai", api.createAIConsultation)
 		r.Patch("/api/v1/consultations/{id}", api.reply)
+		r.Post("/api/v1/consultations/{id}/messages", api.consultationMessage)
 		r.Get("/api/v1/support/messages", api.supportMessages)
 		r.Post("/api/v1/support/messages", api.createSupportMessage)
 		r.Post("/api/v1/recommendations/{kind}", api.recommendation)
@@ -82,9 +89,6 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Patch("/api/v1/ai/chats/{id}", api.renameAIChat)
 		r.Delete("/api/v1/ai/chats/{id}", api.deleteAIChat)
 		r.Post("/api/v1/ai/chats/{id}/messages", api.aiMessage)
-		r.Get("/api/v1/guides", api.guideList)
-		r.Get("/api/v1/guides/{id}", api.guideDetail)
-		r.Post("/api/v1/guides/sync", api.syncGuides)
 		r.Get("/api/v1/articles", api.articleList)
 		r.Get("/api/v1/articles/{id}", api.articleDetail)
 		r.Post("/api/v1/articles", api.createArticle)
@@ -136,8 +140,12 @@ func (a *API) authorize(next http.Handler) http.Handler {
 			write(w, 401, map[string]string{"error": "unauthorized"})
 			return
 		}
-		ctx := r.Context()
-		ctx = withActor(ctx, actor{id, domain.Role(c.Role)})
+		user, e := a.store.UserByID(r.Context(), id)
+		if e != nil || user.Role != domain.Role(c.Role) || deletionExpired(user, time.Now().UTC()) {
+			write(w, 401, map[string]string{"error": "unauthorized"})
+			return
+		}
+		ctx := withActor(r.Context(), actor{id, user.Role})
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -148,9 +156,9 @@ func current(r *http.Request) actor { return r.Context().Value(actorKey).(actor)
 
 func (a *API) register(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		Email, PIN, Role, FullName, Specialization, LicenseNumber string
-		Age                                                       int
-		HeightCM, WeightKG                                        float64
+		Email, PIN, Role, FullName, BirthDate, Gender, Specialization, LicenseNumber string
+		Age                                                                          int
+		HeightCM, WeightKG                                                           float64
 	}
 	if decode(r, &in) != nil {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
@@ -158,12 +166,22 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 	}
 	in.Email = strings.ToLower(strings.TrimSpace(in.Email))
 	in.FullName = strings.TrimSpace(in.FullName)
+	in.BirthDate = strings.TrimSpace(in.BirthDate)
+	in.Gender = strings.ToLower(strings.TrimSpace(in.Gender))
 	if in.FullName == "" {
 		in.FullName = in.Email
 	}
 	role := domain.Role(in.Role)
-	if in.Email == "" || !validPIN(in.PIN) || role != domain.RolePatient {
-		write(w, 422, map[string]string{"error": "регистрация доступна только пользователям; нужны логин и PIN из четырёх цифр"})
+	birth, birthErr := time.Parse("02.01.2006", in.BirthDate)
+	now := time.Now()
+	age := now.Year() - birth.Year()
+	if now.Month() < birth.Month() || (now.Month() == birth.Month() && now.Day() < birth.Day()) {
+		age--
+	}
+	patientValid := role == domain.RolePatient && birthErr == nil && age >= 18 && age <= 120 && (in.Gender == "female" || in.Gender == "male")
+	doctorValid := role == domain.RoleDoctor && in.FullName != "" && strings.TrimSpace(in.Specialization) != ""
+	if in.Email == "" || !validPIN(in.PIN) || (!patientValid && !doctorValid) {
+		write(w, 422, map[string]string{"error": "проверьте роль, профиль и PIN из четырёх цифр"})
 		return
 	}
 	h, e := auth.Hash(in.PIN)
@@ -171,9 +189,16 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 		write(w, 500, map[string]string{"error": "registration failed"})
 		return
 	}
-	u := domain.User{Email: in.Email, PasswordHash: h, Role: role, FullName: in.FullName, Specialization: strings.TrimSpace(in.Specialization), LicenseNumber: strings.TrimSpace(in.LicenseNumber)}
-	if role == domain.RolePatient {
-		profile, profileErr := patientProfile(in.Age, in.HeightCM, in.WeightKG)
+	u := domain.User{Email: in.Email, PasswordHash: h, Role: role, FullName: in.FullName, BirthDate: in.BirthDate, Gender: in.Gender, Specialization: strings.TrimSpace(in.Specialization), LicenseNumber: strings.TrimSpace(in.LicenseNumber), OnlineClinic: role == domain.RolePatient}
+	if role == domain.RoleDoctor {
+		u.DoctorProfile = &domain.DoctorProfile{ScheduleStep: 30, VisibleDays: 6}
+	}
+	// A new user only needs a name and a PIN. Health data is deliberately
+	// collected later, after an explicit explanation of the personalisation it
+	// enables. Keep compatibility with older clients that still send all three
+	// measurements during registration.
+	if role == domain.RolePatient && (in.Age != 0 || in.HeightCM != 0 || in.WeightKG != 0) {
+		profile, profileErr := patientProfile(in.Age, in.HeightCM, in.WeightKG, "")
 		if profileErr != nil {
 			write(w, 422, map[string]string{"error": profileErr.Error()})
 			return
@@ -189,6 +214,7 @@ func (a *API) register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	token, _ := auth.Sign(a.cfg.JWTSecret, u.ID.Hex(), string(u.Role))
+	_ = a.store.RecordUsageEvent(r.Context(), "login", u)
 	write(w, 201, map[string]any{"token": token, "user": u})
 }
 func (a *API) login(w http.ResponseWriter, r *http.Request) {
@@ -204,6 +230,91 @@ func (a *API) login(w http.ResponseWriter, r *http.Request) {
 	u, e := a.store.UserByEmail(r.Context(), strings.ToLower(strings.TrimSpace(in.Email)))
 	if e != nil || !auth.Verify(u.PasswordHash, in.PIN) {
 		write(w, 401, map[string]string{"error": "неверный логин или PIN"})
+		return
+	}
+	if deletionExpired(u, time.Now().UTC()) {
+		write(w, 410, map[string]string{"error": "профиль удалён"})
+		return
+	}
+	token, _ := auth.Sign(a.cfg.JWTSecret, u.ID.Hex(), string(u.Role))
+	_ = a.store.RecordUsageEvent(r.Context(), "login", u)
+	write(w, 200, map[string]any{"token": token, "user": u})
+}
+
+func deletionGracePeriod(role domain.Role) time.Duration {
+	if role == domain.RoleDoctor {
+		return 3 * 24 * time.Hour
+	}
+	return 7 * 24 * time.Hour
+}
+
+func deletionExpired(user domain.User, now time.Time) bool {
+	return user.DeletionScheduledFor != nil && !user.DeletionScheduledFor.After(now)
+}
+
+func (a *API) requestAccountDeletion(w http.ResponseWriter, r *http.Request) {
+	u, err := a.store.UserByID(r.Context(), current(r).ID)
+	if err != nil {
+		write(w, 404, map[string]string{"error": "профиль не найден"})
+		return
+	}
+	if u.Role == domain.RoleAdmin {
+		write(w, 403, map[string]string{"error": "системный профиль администратора удалить нельзя"})
+		return
+	}
+	if u.DeletionScheduledFor != nil {
+		write(w, 200, u)
+		return
+	}
+	now := time.Now().UTC()
+	u, err = a.store.ScheduleAccountDeletion(r.Context(), u.ID, now, now.Add(deletionGracePeriod(u.Role)))
+	if err != nil {
+		write(w, 500, map[string]string{"error": "не удалось запланировать удаление"})
+		return
+	}
+	write(w, 200, u)
+}
+
+func (a *API) cancelAccountDeletion(w http.ResponseWriter, r *http.Request) {
+	u, err := a.store.CancelAccountDeletion(r.Context(), current(r).ID)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "не удалось отменить удаление"})
+		return
+	}
+	write(w, 200, u)
+}
+
+func (a *API) appStats(w http.ResponseWriter, r *http.Request) {
+	if current(r).Role != domain.RoleAdmin {
+		write(w, 403, map[string]string{"error": "only administrators can view application statistics"})
+		return
+	}
+	stats, err := a.store.AppStats(r.Context(), time.Now().UTC().Add(-24*time.Hour))
+	if err != nil {
+		write(w, 500, map[string]string{"error": "could not load application statistics"})
+		return
+	}
+	write(w, 200, stats)
+}
+
+func (a *API) adminImpersonate(w http.ResponseWriter, r *http.Request) {
+	if current(r).Role != domain.RoleAdmin {
+		write(w, 403, map[string]string{"error": "administrator access required"})
+		return
+	}
+	var in struct{ Role string }
+	if decode(r, &in) != nil {
+		write(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	role := domain.Role(strings.TrimSpace(in.Role))
+	if role != domain.RolePatient && role != domain.RoleDoctor {
+		write(w, 422, map[string]string{"error": "choose patient or doctor"})
+		return
+	}
+	u, err := a.store.FirstUserByRole(r.Context(), role)
+	if err != nil {
+		write(w, 404, map[string]string{"error": "no user is available for this role"})
 		return
 	}
 	token, _ := auth.Sign(a.cfg.JWTSecret, u.ID.Hex(), string(u.Role))
@@ -332,7 +443,19 @@ func (a *API) avatar(w http.ResponseWriter, r *http.Request) {
 	}
 	http.ServeContent(w, r, "avatar"+filepath.Ext(user.AvatarPath), info.ModTime(), file)
 }
-func patientProfile(age int, heightCM, weightKG float64) (domain.PatientProfile, error) {
+func patientProfile(age int, heightCM, weightKG float64, birthDate string) (domain.PatientProfile, error) {
+	birthDate = strings.TrimSpace(birthDate)
+	if birthDate != "" {
+		birth, err := time.Parse("02.01.2006", birthDate)
+		if err != nil || birth.After(time.Now()) {
+			return domain.PatientProfile{}, fmt.Errorf("укажите корректную дату рождения")
+		}
+		now := time.Now()
+		age = now.Year() - birth.Year()
+		if now.Month() < birth.Month() || (now.Month() == birth.Month() && now.Day() < birth.Day()) {
+			age--
+		}
+	}
 	if age < 1 || age > 120 {
 		return domain.PatientProfile{}, fmt.Errorf("укажите возраст от 1 до 120 лет")
 	}
@@ -344,7 +467,7 @@ func patientProfile(age int, heightCM, weightKG float64) (domain.PatientProfile,
 	}
 	heightM := heightCM / 100
 	bmi := math.Round(weightKG/(heightM*heightM)*10) / 10
-	return domain.PatientProfile{Age: age, HeightCM: heightCM, WeightKG: weightKG, BMI: bmi}, nil
+	return domain.PatientProfile{Age: age, BirthDate: birthDate, HeightCM: heightCM, WeightKG: weightKG, BMI: bmi}, nil
 }
 func (a *API) updatePatientProfile(w http.ResponseWriter, r *http.Request) {
 	u := current(r)
@@ -354,20 +477,26 @@ func (a *API) updatePatientProfile(w http.ResponseWriter, r *http.Request) {
 	}
 	var in struct {
 		Age                int
+		BirthDate          string
 		HeightCM, WeightKG float64
 		Activity           domain.ActivitySurvey
 		Nutrition          domain.NutritionSurvey
+		DevDataTTLHours    int
 	}
 	if decode(r, &in) != nil {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	profile, err := patientProfile(in.Age, in.HeightCM, in.WeightKG)
+	profile, err := patientProfile(in.Age, in.HeightCM, in.WeightKG, in.BirthDate)
 	if err != nil {
 		write(w, 422, map[string]string{"error": err.Error()})
 		return
 	}
 	currentUser, _ := a.store.UserByID(r.Context(), u.ID)
+	if currentUser.IsDeveloper && (in.DevDataTTLHours < 1 || in.DevDataTTLHours > 720) {
+		write(w, 422, map[string]string{"error": "срок хранения тестовых данных должен быть от 1 до 720 часов"})
+		return
+	}
 	if currentUser.PatientProfile != nil {
 		profile.ActivityRecommendation = currentUser.PatientProfile.ActivityRecommendation
 		profile.NutritionRecommendation = currentUser.PatientProfile.NutritionRecommendation
@@ -379,39 +508,116 @@ func (a *API) updatePatientProfile(w http.ResponseWriter, r *http.Request) {
 		write(w, 500, map[string]string{"error": "could not update profile"})
 		return
 	}
+	if currentUser.IsDeveloper {
+		updated, err = a.store.UpdateDeveloperTTL(r.Context(), u.ID, in.DevDataTTLHours)
+		if err != nil {
+			write(w, 500, map[string]string{"error": "could not update developer retention"})
+			return
+		}
+	}
 	write(w, 200, updated)
 }
 func (a *API) updateContactProfile(w http.ResponseWriter, r *http.Request) {
 	u := current(r)
 	var in struct {
-		FullName           string `json:"fullName"`
-		Phone              string `json:"phone"`
-		ResidentialAddress string `json:"residentialAddress"`
+		FullName     string `json:"fullName"`
+		ContactEmail string `json:"contactEmail"`
+		Phone        string `json:"phone"`
+		City         string `json:"city"`
 	}
 	if decode(r, &in) != nil {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
 	in.FullName = strings.TrimSpace(in.FullName)
+	in.ContactEmail = strings.TrimSpace(in.ContactEmail)
 	in.Phone = strings.TrimSpace(in.Phone)
-	in.ResidentialAddress = strings.TrimSpace(in.ResidentialAddress)
+	in.City = strings.TrimSpace(in.City)
 	if in.FullName == "" || len([]rune(in.FullName)) > 120 {
 		write(w, 422, map[string]string{"error": "укажите имя длиной до 120 символов"})
 		return
 	}
-	if len([]rune(in.Phone)) > 32 || len([]rune(in.ResidentialAddress)) > 300 {
-		write(w, 422, map[string]string{"error": "проверьте телефон и адрес"})
+	if len([]rune(in.ContactEmail)) > 254 || (in.ContactEmail != "" && !strings.Contains(in.ContactEmail, "@")) {
+		write(w, 422, map[string]string{"error": "укажите корректную почту"})
 		return
 	}
-	updated, err := a.store.UpdateContactProfile(r.Context(), u.ID, in.FullName, in.Phone, in.ResidentialAddress)
+	if len([]rune(in.Phone)) > 32 || len([]rune(in.City)) > 100 {
+		write(w, 422, map[string]string{"error": "проверьте телефон и город"})
+		return
+	}
+	updated, err := a.store.UpdateContactProfile(r.Context(), u.ID, in.FullName, in.ContactEmail, in.Phone, in.City)
 	if err != nil {
 		write(w, 500, map[string]string{"error": "could not update contact profile"})
 		return
 	}
 	write(w, 200, updated)
 }
+
+func (a *API) updateDoctorProfile(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "only doctors have this profile"})
+		return
+	}
+	var in struct {
+		FullName, Specialization, City, About, Workplace string
+		Experience, Services                             []string
+		ScheduleStep, VisibleDays                        int
+	}
+	if decode(r, &in) != nil {
+		write(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	in.FullName, in.Specialization, in.City = strings.TrimSpace(in.FullName), strings.TrimSpace(in.Specialization), strings.TrimSpace(in.City)
+	if in.FullName == "" || in.Specialization == "" || len([]rune(in.FullName)) > 120 || len([]rune(in.Specialization)) > 100 || len(in.Experience) > 20 || len(in.Services) > 20 {
+		write(w, 422, map[string]string{"error": "проверьте ФИО, специальность и разделы профиля"})
+		return
+	}
+	if in.ScheduleStep != 15 && in.ScheduleStep != 20 && in.ScheduleStep != 30 && in.ScheduleStep != 60 {
+		in.ScheduleStep = 30
+	}
+	if in.VisibleDays < 3 || in.VisibleDays > 7 {
+		in.VisibleDays = 6
+	}
+	profile := domain.DoctorProfile{About: strings.TrimSpace(in.About), Workplace: strings.TrimSpace(in.Workplace), Experience: cleanLines(in.Experience), Services: cleanLines(in.Services), ScheduleStep: in.ScheduleStep, VisibleDays: in.VisibleDays}
+	updated, err := a.store.UpdateDoctorProfile(r.Context(), u.ID, in.FullName, in.Specialization, in.City, profile)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "could not update doctor profile"})
+		return
+	}
+	write(w, 200, updated)
+}
+
+func cleanLines(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" && len([]rune(value)) <= 500 {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func (a *API) updateSettings(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RolePatient {
+		write(w, 403, map[string]string{"error": "only users can change this setting"})
+		return
+	}
+	var in struct{ OnlineClinic bool }
+	if decode(r, &in) != nil {
+		write(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	updated, err := a.store.UpdateOnlineClinic(r.Context(), u.ID, in.OnlineClinic)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "could not update settings"})
+		return
+	}
+	write(w, 200, updated)
+}
 func (a *API) doctors(w http.ResponseWriter, r *http.Request) {
-	list, e := a.store.Doctors(r.Context(), r.URL.Query().Get("specialty"))
+	list, e := a.store.Doctors(r.Context(), r.URL.Query().Get("specialty"), r.URL.Query().Get("city"))
 	if e != nil {
 		write(w, 500, map[string]string{"error": "could not load doctors"})
 		return
@@ -483,6 +689,26 @@ func (a *API) analyses(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 200, list)
 }
+
+func (a *API) healthSummary(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RolePatient {
+		write(w, 403, map[string]string{"error": "only patients can view their health summary"})
+		return
+	}
+	list, err := a.store.AnalysesFor(r.Context(), u.ID, u.Role)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "could not load analyses"})
+		return
+	}
+	patient, err := a.store.UserByID(r.Context(), u.ID)
+	if err != nil {
+		write(w, 404, map[string]string{"error": "patient not found"})
+		return
+	}
+	result := a.analyzer.PatientHealthSummary(r.Context(), patient, list)
+	write(w, 200, result)
+}
 func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 	u := current(r)
 	if u.Role != domain.RolePatient {
@@ -529,9 +755,9 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	patient, _ := a.store.UserByID(r.Context(), u.ID)
-	text, markers, review, status := a.analyzer.ProcessForPatient(r.Context(), path, mime, patient.PatientProfile)
+	text, markers, status := a.analyzer.RecognizeForPatient(r.Context(), path, mime, patient.PatientProfile)
 	category := analyzer.ClassifyAnalysis(markers, text)
-	item := domain.Analysis{OwnerID: u.ID, Title: category, Category: category, OriginalName: filepath.Base(header.Filename), MimeType: mime, StoragePath: path, OCRText: text, Markers: markers, AIReview: review, Status: status, SharedWith: []primitive.ObjectID{}}
+	item := domain.Analysis{OwnerID: u.ID, Title: category, Category: category, CollectedAt: analyzer.ExtractCollectedAt(text), OriginalName: filepath.Base(header.Filename), MimeType: mime, StoragePath: path, OCRText: text, Markers: markers, AIReview: domain.AIReview{}, Status: status, SharedWith: []primitive.ObjectID{}, IsDeveloper: patient.IsDeveloper}
 	item.ID = id
 	if e = a.store.CreateAnalysis(r.Context(), &item); e != nil {
 		_ = os.Remove(path)
@@ -648,12 +874,51 @@ func (a *API) reprocess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	patient, _ := a.store.UserByID(r.Context(), u.ID)
-	text, markers, review, status := a.analyzer.ProcessForPatient(r.Context(), item.StoragePath, item.MimeType, patient.PatientProfile)
-	if err = a.store.UpdateAnalysisRecognition(r.Context(), id, u.ID, text, markers, review, status); err != nil {
+	text, markers, status := a.analyzer.RecognizeForPatient(r.Context(), item.StoragePath, item.MimeType, patient.PatientProfile)
+	collectedAt := analyzer.ExtractCollectedAt(text)
+	if err = a.store.UpdateAnalysisRecognition(r.Context(), id, u.ID, text, markers, domain.AIReview{}, status, collectedAt); err != nil {
 		write(w, 500, map[string]string{"error": "could not update recognition"})
 		return
 	}
-	item.OCRText, item.Markers, item.AIReview, item.Status = text, markers, review, status
+	item.OCRText, item.Markers, item.AIReview, item.Status, item.CollectedAt = text, markers, domain.AIReview{}, status, collectedAt
+	write(w, 200, item)
+}
+
+func (a *API) confirmAnalysis(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RolePatient {
+		write(w, 403, map[string]string{"error": "only patients can confirm analyses"})
+		return
+	}
+	id, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		write(w, 400, map[string]string{"error": "invalid id"})
+		return
+	}
+	item, err := a.store.Analysis(r.Context(), id)
+	if err != nil || item.OwnerID != u.ID {
+		write(w, 404, map[string]string{"error": "analysis not found"})
+		return
+	}
+	var in struct {
+		Markers []domain.Marker `json:"markers"`
+	}
+	if decode(r, &in) != nil {
+		write(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	markers, err := analyzer.NormalizeConfirmedMarkers(in.Markers)
+	if err != nil {
+		write(w, 422, map[string]string{"error": "check marker values"})
+		return
+	}
+	patient, _ := a.store.UserByID(r.Context(), u.ID)
+	review := a.analyzer.ReviewMarkersForPatient(r.Context(), markers, patient.PatientProfile)
+	if err = a.store.ConfirmAnalysis(r.Context(), id, u.ID, markers, review); err != nil {
+		write(w, 500, map[string]string{"error": "could not confirm analysis"})
+		return
+	}
+	item.Markers, item.AIReview, item.Status = markers, review, "ready"
 	write(w, 200, item)
 }
 func (a *API) share(w http.ResponseWriter, r *http.Request) {
@@ -700,15 +965,29 @@ func (a *API) consultations(w http.ResponseWriter, r *http.Request) {
 	if list == nil {
 		list = []domain.Consultation{}
 	}
+	if u.Role == domain.RoleDoctor {
+		for i := range list {
+			if patient, err := a.store.UserByID(r.Context(), list[i].PatientID); err == nil {
+				list[i].PatientName = patient.FullName
+			}
+		}
+	}
 	write(w, 200, list)
 }
 func (a *API) supportMessages(w http.ResponseWriter, r *http.Request) {
 	u := current(r)
-	if u.Role != domain.RolePatient {
-		write(w, 403, map[string]string{"error": "support chat is available to patients"})
-		return
+	var list []domain.SupportMessage
+	var err error
+	if u.Role == domain.RoleAdmin {
+		list, err = a.store.AllSupportMessages(r.Context())
+		for i := range list {
+			if patient, userErr := a.store.UserByID(r.Context(), list[i].UserID); userErr == nil {
+				list[i].PatientName = patient.FullName
+			}
+		}
+	} else {
+		list, err = a.store.SupportMessages(r.Context(), u.ID)
 	}
-	list, err := a.store.SupportMessages(r.Context(), u.ID)
 	if err != nil {
 		write(w, 500, map[string]string{"error": "could not load support chat"})
 		return
@@ -720,12 +999,9 @@ func (a *API) supportMessages(w http.ResponseWriter, r *http.Request) {
 }
 func (a *API) createSupportMessage(w http.ResponseWriter, r *http.Request) {
 	u := current(r)
-	if u.Role != domain.RolePatient {
-		write(w, 403, map[string]string{"error": "support chat is available to patients"})
-		return
-	}
 	var in struct {
-		Text string `json:"text"`
+		Text   string `json:"text"`
+		UserID string `json:"userId"`
 	}
 	if decode(r, &in) != nil {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
@@ -736,7 +1012,16 @@ func (a *API) createSupportMessage(w http.ResponseWriter, r *http.Request) {
 		write(w, 422, map[string]string{"error": "message must contain 1 to 4000 characters"})
 		return
 	}
-	message := domain.SupportMessage{UserID: u.ID, Sender: "patient", Text: in.Text}
+	target, sender := u.ID, "patient"
+	if u.Role == domain.RoleAdmin {
+		parsed, parseErr := primitive.ObjectIDFromHex(strings.TrimSpace(in.UserID))
+		if parseErr != nil {
+			write(w, 422, map[string]string{"error": "patient is required"})
+			return
+		}
+		target, sender = parsed, "support"
+	}
+	message := domain.SupportMessage{UserID: target, Sender: sender, Text: in.Text}
 	if err := a.store.CreateSupportMessage(r.Context(), &message); err != nil {
 		write(w, 500, map[string]string{"error": "could not send support message"})
 		return
@@ -823,6 +1108,9 @@ func (a *API) createConsultation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	c := domain.Consultation{ID: primitive.NewObjectID(), AnalysisID: aid, PatientID: u.ID, DoctorID: did, Source: "doctor", Title: title, Specialty: doctor.Specialization, ServiceType: serviceType, AppointmentAt: appointmentAt, PersonalDataConsent: in.PersonalDataConsent, MedicalDataConsent: in.MedicalDataConsent, Question: strings.TrimSpace(in.Question)}
+	if c.Question != "" {
+		c.Messages = []domain.ConsultationMessage{{Sender: "patient", Text: c.Question, CreatedAt: time.Now().UTC()}}
+	}
 	if serviceType == "appointment" {
 		if e = a.store.ReserveSlot(r.Context(), did, u.ID, c.ID, appointmentAt.UTC()); e != nil {
 			write(w, 409, map[string]string{"error": "это время уже занято; выберите другое"})
@@ -945,6 +1233,26 @@ func (a *API) reply(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, map[string]string{"status": in.Status})
 }
 
+func (a *API) consultationMessage(w http.ResponseWriter, r *http.Request) {
+	u := current(r)
+	if u.Role != domain.RolePatient && u.Role != domain.RoleDoctor {
+		write(w, 403, map[string]string{"error": "chat is not available"})
+		return
+	}
+	id, err := parseID(chi.URLParam(r, "id"))
+	var in struct{ Text string }
+	if err != nil || decode(r, &in) != nil || strings.TrimSpace(in.Text) == "" || len([]rune(in.Text)) > 4000 {
+		write(w, 422, map[string]string{"error": "message is required"})
+		return
+	}
+	message := domain.ConsultationMessage{Sender: string(u.Role), Text: strings.TrimSpace(in.Text), CreatedAt: time.Now().UTC()}
+	if err = a.store.AppendConsultationMessage(r.Context(), id, u.ID, u.Role, message); err != nil {
+		write(w, 404, map[string]string{"error": "consultation not found"})
+		return
+	}
+	write(w, 201, message)
+}
+
 func dateRange(r *http.Request) (time.Time, time.Time, error) {
 	from, err := time.Parse(time.RFC3339, r.URL.Query().Get("from"))
 	if err != nil {
@@ -991,8 +1299,9 @@ func (a *API) replaceSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		From, To string
-		Starts   []string
+		From, To    string
+		Starts      []string
+		SlotMinutes int
 	}
 	if decode(r, &in) != nil {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
@@ -1012,7 +1321,7 @@ func (a *API) replaceSchedule(w http.ResponseWriter, r *http.Request) {
 	seen := map[int64]bool{}
 	for _, raw := range in.Starts {
 		v, e := time.Parse(time.RFC3339, raw)
-		if e != nil || v.Before(from) || !v.Before(to) || v.Before(time.Now().UTC()) || v.Minute()%30 != 0 {
+		if e != nil || v.Before(from) || !v.Before(to) || v.Before(time.Now().UTC()) {
 			write(w, 422, map[string]string{"error": "invalid slot"})
 			return
 		}
@@ -1021,7 +1330,7 @@ func (a *API) replaceSchedule(w http.ResponseWriter, r *http.Request) {
 			starts = append(starts, v.UTC())
 		}
 	}
-	if err = a.store.ReplaceSchedule(r.Context(), u.ID, from.UTC(), to.UTC(), starts); err != nil {
+	if err = a.store.ReplaceSchedule(r.Context(), u.ID, from.UTC(), to.UTC(), starts, in.SlotMinutes); err != nil {
 		write(w, 500, map[string]string{"error": "could not save schedule"})
 		return
 	}
@@ -1075,16 +1384,16 @@ func (a *API) createPatientNote(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 201, note)
 }
-func (a *API) requireDoctor(w http.ResponseWriter, r *http.Request) (actor, bool) {
+func (a *API) requireAIUser(w http.ResponseWriter, r *http.Request) (actor, bool) {
 	u := current(r)
-	if u.Role != domain.RoleDoctor {
-		write(w, 403, map[string]string{"error": "only doctors can use AI workspace"})
+	if u.Role != domain.RoleDoctor && u.Role != domain.RolePatient {
+		write(w, 403, map[string]string{"error": "AI workspace is not available for this role"})
 		return u, false
 	}
 	return u, true
 }
 func (a *API) aiChats(w http.ResponseWriter, r *http.Request) {
-	u, ok := a.requireDoctor(w, r)
+	u, ok := a.requireAIUser(w, r)
 	if !ok {
 		return
 	}
@@ -1099,7 +1408,7 @@ func (a *API) aiChats(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, items)
 }
 func (a *API) createAIChat(w http.ResponseWriter, r *http.Request) {
-	u, ok := a.requireDoctor(w, r)
+	u, ok := a.requireAIUser(w, r)
 	if !ok {
 		return
 	}
@@ -1107,7 +1416,7 @@ func (a *API) createAIChat(w http.ResponseWriter, r *http.Request) {
 	_ = decode(r, &in)
 	title := strings.TrimSpace(in.Title)
 	if title == "" {
-		title = "Консультация · " + time.Now().Format("02.01.2006 15:04")
+		title = time.Now().Format("02.01.2006 · 15:04")
 	}
 	chat := domain.AIChat{DoctorID: u.ID, Title: title}
 	if e := a.store.CreateAIChat(r.Context(), &chat); e != nil {
@@ -1117,7 +1426,7 @@ func (a *API) createAIChat(w http.ResponseWriter, r *http.Request) {
 	write(w, 201, chat)
 }
 func (a *API) aiChat(w http.ResponseWriter, r *http.Request) {
-	u, ok := a.requireDoctor(w, r)
+	u, ok := a.requireAIUser(w, r)
 	if !ok {
 		return
 	}
@@ -1134,7 +1443,7 @@ func (a *API) aiChat(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, chat)
 }
 func (a *API) renameAIChat(w http.ResponseWriter, r *http.Request) {
-	u, ok := a.requireDoctor(w, r)
+	u, ok := a.requireAIUser(w, r)
 	if !ok {
 		return
 	}
@@ -1151,7 +1460,7 @@ func (a *API) renameAIChat(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, map[string]string{"status": "saved"})
 }
 func (a *API) deleteAIChat(w http.ResponseWriter, r *http.Request) {
-	u, ok := a.requireDoctor(w, r)
+	u, ok := a.requireAIUser(w, r)
 	if !ok {
 		return
 	}
@@ -1163,7 +1472,7 @@ func (a *API) deleteAIChat(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(204)
 }
 func (a *API) aiMessage(w http.ResponseWriter, r *http.Request) {
-	u, ok := a.requireDoctor(w, r)
+	u, ok := a.requireAIUser(w, r)
 	if !ok {
 		return
 	}
@@ -1193,48 +1502,14 @@ func (a *API) aiMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	write(w, 201, assistant)
 }
-func (a *API) guideList(w http.ResponseWriter, r *http.Request) {
-	if current(r).Role != domain.RoleDoctor {
-		write(w, 403, map[string]string{"error": "only doctors can view guides"})
-		return
-	}
-	items, synced, e := a.guides.List(r.Context())
-	if e != nil {
-		write(w, 503, map[string]string{"error": "official catalog is temporarily unavailable"})
-		return
-	}
-	write(w, 200, map[string]any{"items": items, "synced_at": synced, "source": "Минздрав России"})
-}
-func (a *API) guideDetail(w http.ResponseWriter, r *http.Request) {
-	if current(r).Role != domain.RoleDoctor {
-		write(w, 403, map[string]string{"error": "only doctors can view guides"})
-		return
-	}
-	item, e := a.guides.Get(r.Context(), chi.URLParam(r, "id"))
-	if e != nil {
-		write(w, 502, map[string]string{"error": "could not load the official guide"})
-		return
-	}
-	write(w, 200, item)
-}
-func (a *API) syncGuides(w http.ResponseWriter, r *http.Request) {
-	if current(r).Role != domain.RoleDoctor {
-		write(w, 403, map[string]string{"error": "only doctors can sync guides"})
-		return
-	}
-	if e := a.guides.Sync(r.Context()); e != nil {
-		write(w, 503, map[string]string{"error": "official catalog is temporarily unavailable"})
-		return
-	}
-	items, synced, _ := a.guides.List(r.Context())
-	write(w, 200, map[string]any{"items": items, "synced_at": synced, "source": "Минздрав России"})
-}
-
 func (a *API) articleList(w http.ResponseWriter, r *http.Request) {
 	items, err := a.store.ClinicalArticles(r.Context(), current(r).Role == domain.RoleDoctor)
 	if err != nil {
 		write(w, 500, map[string]string{"error": "could not load articles"})
 		return
+	}
+	if items == nil {
+		items = []domain.ClinicalArticle{}
 	}
 	write(w, 200, items)
 }

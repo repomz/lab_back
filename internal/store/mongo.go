@@ -3,6 +3,9 @@ package store
 import (
 	"context"
 	"errors"
+	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/repomz/lab_back/internal/domain"
@@ -27,12 +30,16 @@ func Connect(ctx context.Context, uri, database string) (*Mongo, error) {
 		collection string
 		models     []mongo.IndexModel
 	}{
-		{"users", []mongo.IndexModel{{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)}}},
+		{"users", []mongo.IndexModel{
+			{Keys: bson.D{{Key: "email", Value: 1}}, Options: options.Index().SetUnique(true)},
+			{Keys: bson.D{{Key: "deletion_scheduled_for", Value: 1}}},
+		}},
 		{"schedule_slots", []mongo.IndexModel{{Keys: bson.D{{Key: "doctor_id", Value: 1}, {Key: "start_at", Value: 1}}, Options: options.Index().SetUnique(true)}}},
 		{"analyses", []mongo.IndexModel{
 			{Keys: bson.D{{Key: "owner_id", Value: 1}, {Key: "created_at", Value: -1}}},
 			{Keys: bson.D{{Key: "shared_with", Value: 1}, {Key: "created_at", Value: -1}}},
 		}},
+		{"usage_events", []mongo.IndexModel{{Keys: bson.D{{Key: "kind", Value: 1}, {Key: "created_at", Value: -1}}}}},
 		{"consultations", []mongo.IndexModel{
 			{Keys: bson.D{{Key: "patient_id", Value: 1}, {Key: "created_at", Value: -1}}},
 			{Keys: bson.D{{Key: "doctor_id", Value: 1}, {Key: "created_at", Value: -1}}},
@@ -81,6 +88,14 @@ func (s *Mongo) CreateUser(ctx context.Context, u *domain.User) error {
 	_, err := s.db.Collection("users").InsertOne(ctx, u)
 	return err
 }
+func (s *Mongo) EnsureSystemUser(ctx context.Context, email, passwordHash, fullName string, role domain.Role) error {
+	now := time.Now().UTC()
+	_, err := s.db.Collection("users").UpdateOne(ctx, bson.M{"email": email}, bson.M{
+		"$set":         bson.M{"password_hash": passwordHash, "full_name": fullName, "role": role, "verified": true},
+		"$setOnInsert": bson.M{"_id": primitive.NewObjectID(), "created_at": now},
+	}, options.Update().SetUpsert(true))
+	return err
+}
 func (s *Mongo) UserByEmail(ctx context.Context, email string) (domain.User, error) {
 	var u domain.User
 	err := s.db.Collection("users").FindOne(ctx, bson.M{"email": email}).Decode(&u)
@@ -90,6 +105,35 @@ func (s *Mongo) UserByID(ctx context.Context, id primitive.ObjectID) (domain.Use
 	var u domain.User
 	err := s.db.Collection("users").FindOne(ctx, bson.M{"_id": id}).Decode(&u)
 	return u, err
+}
+
+func (s *Mongo) ScheduleAccountDeletion(ctx context.Context, id primitive.ObjectID, requestedAt, scheduledFor time.Time) (domain.User, error) {
+	var user domain.User
+	err := s.db.Collection("users").FindOneAndUpdate(ctx,
+		bson.M{"_id": id, "role": bson.M{"$ne": domain.RoleAdmin}},
+		bson.M{"$set": bson.M{"deletion_requested_at": requestedAt, "deletion_scheduled_for": scheduledFor}},
+		options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(bson.M{"password_hash": 0}),
+	).Decode(&user)
+	return user, err
+}
+
+func (s *Mongo) CancelAccountDeletion(ctx context.Context, id primitive.ObjectID) (domain.User, error) {
+	var user domain.User
+	err := s.db.Collection("users").FindOneAndUpdate(ctx,
+		bson.M{"_id": id, "role": bson.M{"$ne": domain.RoleAdmin}},
+		bson.M{"$unset": bson.M{"deletion_requested_at": "", "deletion_scheduled_for": ""}},
+		options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(bson.M{"password_hash": 0}),
+	).Decode(&user)
+	return user, err
+}
+func (s *Mongo) FirstUserByRole(ctx context.Context, role domain.Role) (domain.User, error) {
+	filter := bson.M{"role": role, "$or": []bson.M{{"deletion_scheduled_for": bson.M{"$exists": false}}, {"deletion_scheduled_for": bson.M{"$gt": time.Now().UTC()}}}}
+	if role == domain.RolePatient {
+		filter["is_developer"] = bson.M{"$ne": true}
+	}
+	var user domain.User
+	err := s.db.Collection("users").FindOne(ctx, filter, options.FindOne().SetSort(bson.D{{Key: "created_at", Value: 1}})).Decode(&user)
+	return user, err
 }
 func (s *Mongo) UpdatePatientProfile(ctx context.Context, id primitive.ObjectID, profile domain.PatientProfile) (domain.User, error) {
 	profile.UpdatedAt = time.Now().UTC()
@@ -103,16 +147,46 @@ func (s *Mongo) UpdatePatientProfile(ctx context.Context, id primitive.ObjectID,
 	err := r.Decode(&u)
 	return u, err
 }
-func (s *Mongo) UpdateContactProfile(ctx context.Context, id primitive.ObjectID, fullName, phone, address string) (domain.User, error) {
+func (s *Mongo) UpdateDeveloperTTL(ctx context.Context, id primitive.ObjectID, hours int) (domain.User, error) {
+	var user domain.User
+	err := s.db.Collection("users").FindOneAndUpdate(ctx,
+		bson.M{"_id": id, "role": domain.RolePatient, "is_developer": true},
+		bson.M{"$set": bson.M{"dev_data_ttl_hours": hours}},
+		options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(bson.M{"password_hash": 0}),
+	).Decode(&user)
+	return user, err
+}
+func (s *Mongo) UpdateContactProfile(ctx context.Context, id primitive.ObjectID, fullName, contactEmail, phone, city string) (domain.User, error) {
 	r := s.db.Collection("users").FindOneAndUpdate(
 		ctx,
 		bson.M{"_id": id},
-		bson.M{"$set": bson.M{"full_name": fullName, "phone": phone, "residential_address": address}},
+		bson.M{"$set": bson.M{"full_name": fullName, "contact_email": contactEmail, "phone": phone, "city": city}, "$unset": bson.M{"residential_address": ""}},
 		options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(bson.M{"password_hash": 0}),
 	)
 	var u domain.User
 	err := r.Decode(&u)
 	return u, err
+}
+
+func (s *Mongo) UpdateDoctorProfile(ctx context.Context, id primitive.ObjectID, fullName, specialization, city string, profile domain.DoctorProfile) (domain.User, error) {
+	profile.About = strings.TrimSpace(profile.About)
+	profile.Workplace = strings.TrimSpace(profile.Workplace)
+	var user domain.User
+	err := s.db.Collection("users").FindOneAndUpdate(ctx,
+		bson.M{"_id": id, "role": domain.RoleDoctor},
+		bson.M{"$set": bson.M{"full_name": fullName, "specialization": specialization, "city": city, "doctor_profile": profile}},
+		options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(bson.M{"password_hash": 0}),
+	).Decode(&user)
+	return user, err
+}
+
+func (s *Mongo) UpdateOnlineClinic(ctx context.Context, id primitive.ObjectID, enabled bool) (domain.User, error) {
+	var user domain.User
+	err := s.db.Collection("users").FindOneAndUpdate(ctx,
+		bson.M{"_id": id, "role": domain.RolePatient}, bson.M{"$set": bson.M{"online_clinic": enabled}},
+		options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(bson.M{"password_hash": 0}),
+	).Decode(&user)
+	return user, err
 }
 func (s *Mongo) UpdateAvatar(ctx context.Context, id primitive.ObjectID, path, preset string) (domain.User, error) {
 	now := time.Now().UTC()
@@ -133,10 +207,13 @@ func (s *Mongo) UpdateAvatar(ctx context.Context, id primitive.ObjectID, path, p
 	err := s.db.Collection("users").FindOneAndUpdate(ctx, bson.M{"_id": id}, update, options.FindOneAndUpdate().SetReturnDocument(options.After).SetProjection(bson.M{"password_hash": 0})).Decode(&user)
 	return user, err
 }
-func (s *Mongo) Doctors(ctx context.Context, specialty string) ([]domain.User, error) {
-	f := bson.M{"role": domain.RoleDoctor}
+func (s *Mongo) Doctors(ctx context.Context, specialty, city string) ([]domain.User, error) {
+	f := bson.M{"role": domain.RoleDoctor, "$or": []bson.M{{"deletion_scheduled_for": bson.M{"$exists": false}}, {"deletion_scheduled_for": bson.M{"$gt": time.Now().UTC()}}}}
 	if specialty != "" {
 		f["specialization"] = bson.M{"$regex": specialty, "$options": "i"}
+	}
+	if strings.TrimSpace(city) != "" {
+		f["city"] = bson.M{"$regex": "^" + regexp.QuoteMeta(strings.TrimSpace(city)) + "$", "$options": "i"}
 	}
 	cur, err := s.db.Collection("users").Find(ctx, f, options.Find().SetProjection(bson.M{"password_hash": 0}).SetSort(bson.D{{Key: "verified", Value: -1}, {Key: "full_name", Value: 1}}))
 	if err != nil {
@@ -154,6 +231,246 @@ func (s *Mongo) CreateAnalysis(ctx context.Context, a *domain.Analysis) error {
 	a.UpdatedAt = now
 	_, err := s.db.Collection("analyses").InsertOne(ctx, a)
 	return err
+}
+
+func (s *Mongo) RecordUsageEvent(ctx context.Context, kind string, user domain.User) error {
+	if user.Role != domain.RolePatient || user.IsDeveloper {
+		return nil
+	}
+	_, err := s.db.Collection("usage_events").InsertOne(ctx, bson.M{"kind": kind, "user_id": user.ID, "created_at": time.Now().UTC()})
+	return err
+}
+
+func (s *Mongo) AppStats(ctx context.Context, since time.Time) (domain.AppStats, error) {
+	regularUser := bson.M{"$ne": true}
+	developerValues, err := s.db.Collection("users").Distinct(ctx, "_id", bson.M{"role": domain.RolePatient, "is_developer": true})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	developerIDs := make([]primitive.ObjectID, 0, len(developerValues))
+	for _, value := range developerValues {
+		if id, ok := value.(primitive.ObjectID); ok {
+			developerIDs = append(developerIDs, id)
+		}
+	}
+	regularPatient := bson.M{"$nin": developerIDs}
+	totalUsers, err := s.db.Collection("users").CountDocuments(ctx, bson.M{"role": domain.RolePatient, "is_developer": regularUser})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	users, err := s.db.Collection("users").CountDocuments(ctx, bson.M{"role": domain.RolePatient, "is_developer": regularUser, "created_at": bson.M{"$gte": since}})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	logins, err := s.db.Collection("usage_events").CountDocuments(ctx, bson.M{"kind": "login", "created_at": bson.M{"$gte": since}})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	uploaded, err := s.db.Collection("analyses").CountDocuments(ctx, bson.M{"is_developer": regularUser, "created_at": bson.M{"$gte": since}})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	totalUploaded, err := s.db.Collection("analyses").CountDocuments(ctx, bson.M{"is_developer": regularUser})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	totalDoctors, err := s.db.Collection("users").CountDocuments(ctx, bson.M{"role": domain.RoleDoctor})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	consultations, err := s.db.Collection("consultations").CountDocuments(ctx, bson.M{"source": "doctor", "patient_id": regularPatient, "created_at": bson.M{"$gte": since}})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	appointments, err := s.db.Collection("consultations").CountDocuments(ctx, bson.M{"service_type": "appointment", "patient_id": regularPatient, "created_at": bson.M{"$gte": since}})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	support, err := s.db.Collection("support_messages").CountDocuments(ctx, bson.M{"user_id": regularPatient, "created_at": bson.M{"$gte": since}})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	aiRequests, err := s.db.Collection("consultations").CountDocuments(ctx, bson.M{"source": "ai", "patient_id": regularPatient, "created_at": bson.M{"$gte": since}})
+	if err != nil {
+		return domain.AppStats{}, err
+	}
+	return domain.AppStats{TotalUsers: totalUsers, NewUsers: users, Logins: logins, UploadedTests: uploaded, TotalUploadedTests: totalUploaded, TotalDoctors: totalDoctors, Consultations24h: consultations, Appointments24h: appointments, SupportMessages24h: support, AIRequests24h: aiRequests}, nil
+}
+
+// CleanupDeveloperData removes expired content from developer patient accounts.
+// The account and profile remain; booked doctor slots return to availability.
+func (s *Mongo) CleanupDeveloperData(ctx context.Context) ([]string, error) {
+	cur, err := s.db.Collection("users").Find(ctx, bson.M{"role": domain.RolePatient, "is_developer": true})
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var users []domain.User
+	if err = cur.All(ctx, &users); err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, user := range users {
+		hours := user.DevDataTTLHours
+		if hours < 1 {
+			hours = 24
+		}
+		cutoff := time.Now().UTC().Add(-time.Duration(hours) * time.Hour)
+		analysisCur, findErr := s.db.Collection("analyses").Find(ctx, bson.M{"owner_id": user.ID, "created_at": bson.M{"$lt": cutoff}})
+		if findErr != nil {
+			return paths, findErr
+		}
+		var analyses []domain.Analysis
+		if findErr = analysisCur.All(ctx, &analyses); findErr != nil {
+			analysisCur.Close(ctx)
+			return paths, findErr
+		}
+		analysisCur.Close(ctx)
+		for _, analysis := range analyses {
+			if analysis.StoragePath != "" {
+				paths = append(paths, analysis.StoragePath)
+			}
+		}
+		if _, err = s.db.Collection("analyses").DeleteMany(ctx, bson.M{"owner_id": user.ID, "created_at": bson.M{"$lt": cutoff}}); err != nil {
+			return paths, err
+		}
+		var expired []domain.Consultation
+		consultationCur, findErr := s.db.Collection("consultations").Find(ctx, bson.M{"patient_id": user.ID, "created_at": bson.M{"$lt": cutoff}})
+		if findErr != nil {
+			return paths, findErr
+		}
+		if findErr = consultationCur.All(ctx, &expired); findErr != nil {
+			consultationCur.Close(ctx)
+			return paths, findErr
+		}
+		consultationCur.Close(ctx)
+		for _, item := range expired {
+			_, _ = s.db.Collection("schedule_slots").UpdateMany(ctx, bson.M{"appointment_id": item.ID}, bson.M{"$set": bson.M{"status": "available", "updated_at": time.Now().UTC()}, "$unset": bson.M{"patient_id": "", "appointment_id": ""}})
+		}
+		if _, err = s.db.Collection("consultations").DeleteMany(ctx, bson.M{"patient_id": user.ID, "created_at": bson.M{"$lt": cutoff}}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("support_messages").DeleteMany(ctx, bson.M{"user_id": user.ID, "created_at": bson.M{"$lt": cutoff}}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("patient_notes").DeleteMany(ctx, bson.M{"patient_id": user.ID, "created_at": bson.M{"$lt": cutoff}}); err != nil {
+			return paths, err
+		}
+	}
+	return paths, nil
+}
+
+// CleanupScheduledAccountDeletions permanently removes expired profiles and
+// every record owned by, addressed to, or created by those profiles. Files are
+// returned to the caller so the process layer can remove them from disk.
+func (s *Mongo) CleanupScheduledAccountDeletions(ctx context.Context, uploadDir string) ([]string, error) {
+	now := time.Now().UTC()
+	cur, err := s.db.Collection("users").Find(ctx, bson.M{
+		"role":                   bson.M{"$ne": domain.RoleAdmin},
+		"deletion_scheduled_for": bson.M{"$lte": now},
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var users []domain.User
+	if err = cur.All(ctx, &users); err != nil {
+		return nil, err
+	}
+	var paths []string
+	for _, user := range users {
+		analysisCur, findErr := s.db.Collection("analyses").Find(ctx, bson.M{"owner_id": user.ID})
+		if findErr != nil {
+			return paths, findErr
+		}
+		var analyses []domain.Analysis
+		if findErr = analysisCur.All(ctx, &analyses); findErr != nil {
+			analysisCur.Close(ctx)
+			return paths, findErr
+		}
+		analysisCur.Close(ctx)
+		for _, analysis := range analyses {
+			if analysis.StoragePath != "" {
+				paths = append(paths, analysis.StoragePath)
+			}
+		}
+
+		articleCur, findErr := s.db.Collection("clinical_articles").Find(ctx, bson.M{"doctor_id": user.ID})
+		if findErr != nil {
+			return paths, findErr
+		}
+		var articles []domain.ClinicalArticle
+		if findErr = articleCur.All(ctx, &articles); findErr != nil {
+			articleCur.Close(ctx)
+			return paths, findErr
+		}
+		articleCur.Close(ctx)
+		for _, article := range articles {
+			if path := uploadedArticleMediaPath(uploadDir, article.CoverURL); path != "" {
+				paths = append(paths, path)
+			}
+			for _, block := range article.Blocks {
+				if path := uploadedArticleMediaPath(uploadDir, block.ImageURL); path != "" {
+					paths = append(paths, path)
+				}
+			}
+		}
+		if user.AvatarPath != "" {
+			paths = append(paths, user.AvatarPath)
+		}
+
+		// A patient's booked slots become available again. A departing doctor's
+		// complete calendar is removed with the professional profile.
+		if _, err = s.db.Collection("schedule_slots").UpdateMany(ctx, bson.M{"patient_id": user.ID}, bson.M{
+			"$set":   bson.M{"status": "available", "updated_at": now},
+			"$unset": bson.M{"patient_id": "", "appointment_id": ""},
+		}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("schedule_slots").DeleteMany(ctx, bson.M{"doctor_id": user.ID}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("consultations").DeleteMany(ctx, bson.M{"$or": []bson.M{{"patient_id": user.ID}, {"doctor_id": user.ID}}}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("support_messages").DeleteMany(ctx, bson.M{"user_id": user.ID}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("patient_notes").DeleteMany(ctx, bson.M{"$or": []bson.M{{"patient_id": user.ID}, {"doctor_id": user.ID}}}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("ai_chats").DeleteMany(ctx, bson.M{"doctor_id": user.ID}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("clinical_articles").DeleteMany(ctx, bson.M{"doctor_id": user.ID}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("usage_events").DeleteMany(ctx, bson.M{"user_id": user.ID}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("analyses").DeleteMany(ctx, bson.M{"owner_id": user.ID}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("analyses").UpdateMany(ctx, bson.M{"shared_with": user.ID}, bson.M{"$pull": bson.M{"shared_with": user.ID}}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("users").DeleteOne(ctx, bson.M{"_id": user.ID, "deletion_scheduled_for": bson.M{"$lte": now}}); err != nil {
+			return paths, err
+		}
+	}
+	return paths, nil
+}
+
+func uploadedArticleMediaPath(uploadDir, rawURL string) string {
+	const prefix = "/api/v1/articles/media/"
+	if !strings.HasPrefix(rawURL, prefix) {
+		return ""
+	}
+	name := filepath.Base(strings.TrimPrefix(rawURL, prefix))
+	if name == "." || name == "" {
+		return ""
+	}
+	return filepath.Join(uploadDir, "article-media", name)
 }
 func (s *Mongo) Analysis(ctx context.Context, id primitive.ObjectID) (domain.Analysis, error) {
 	var a domain.Analysis
@@ -185,10 +502,25 @@ func (s *Mongo) ShareAllAnalyses(ctx context.Context, owner, doctor primitive.Ob
 	_, err := s.db.Collection("analyses").UpdateMany(ctx, bson.M{"owner_id": owner}, bson.M{"$addToSet": bson.M{"shared_with": doctor}, "$set": bson.M{"updated_at": time.Now().UTC()}})
 	return err
 }
-func (s *Mongo) UpdateAnalysisRecognition(ctx context.Context, id, owner primitive.ObjectID, text string, markers []domain.Marker, review domain.AIReview, status string) error {
+func (s *Mongo) UpdateAnalysisRecognition(ctx context.Context, id, owner primitive.ObjectID, text string, markers []domain.Marker, review domain.AIReview, status string, collectedAt *time.Time) error {
+	set := bson.M{"ocr_text": text, "markers": markers, "ai_review": review, "status": status, "updated_at": time.Now().UTC()}
+	if collectedAt != nil {
+		set["collected_at"] = collectedAt
+	}
 	r, err := s.db.Collection("analyses").UpdateOne(ctx,
 		bson.M{"_id": id, "owner_id": owner},
-		bson.M{"$set": bson.M{"ocr_text": text, "markers": markers, "ai_review": review, "status": status, "updated_at": time.Now().UTC()}},
+		bson.M{"$set": set},
+	)
+	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+
+func (s *Mongo) ConfirmAnalysis(ctx context.Context, id, owner primitive.ObjectID, markers []domain.Marker, review domain.AIReview) error {
+	r, err := s.db.Collection("analyses").UpdateOne(ctx,
+		bson.M{"_id": id, "owner_id": owner},
+		bson.M{"$set": bson.M{"markers": markers, "ai_review": review, "status": "ready", "updated_at": time.Now().UTC()}},
 	)
 	if err == nil && r.MatchedCount == 0 {
 		return mongo.ErrNoDocuments
@@ -232,7 +564,7 @@ func (s *Mongo) PatientsForDoctor(ctx context.Context, doctor primitive.ObjectID
 			objectIDs = append(objectIDs, id)
 		}
 	}
-	cur, err := s.db.Collection("users").Find(ctx, bson.M{"_id": bson.M{"$in": objectIDs}}, options.Find().SetProjection(bson.M{"password_hash": 0}).SetSort(bson.D{{Key: "full_name", Value: 1}}))
+	cur, err := s.db.Collection("users").Find(ctx, bson.M{"_id": bson.M{"$in": objectIDs}, "$or": []bson.M{{"deletion_scheduled_for": bson.M{"$exists": false}}, {"deletion_scheduled_for": bson.M{"$gt": time.Now().UTC()}}}}, options.Find().SetProjection(bson.M{"password_hash": 0}).SetSort(bson.D{{Key: "full_name", Value: 1}}))
 	if err != nil {
 		return nil, err
 	}
@@ -302,6 +634,17 @@ func (s *Mongo) SupportMessages(ctx context.Context, user primitive.ObjectID) ([
 	return out, err
 }
 
+func (s *Mongo) AllSupportMessages(ctx context.Context) ([]domain.SupportMessage, error) {
+	cur, err := s.db.Collection("support_messages").Find(ctx, bson.M{}, options.Find().SetSort(bson.D{{Key: "created_at", Value: 1}}).SetLimit(1000))
+	if err != nil {
+		return nil, err
+	}
+	defer cur.Close(ctx)
+	var out []domain.SupportMessage
+	err = cur.All(ctx, &out)
+	return out, err
+}
+
 func (s *Mongo) CreateSupportMessage(ctx context.Context, message *domain.SupportMessage) error {
 	if message.ID.IsZero() {
 		message.ID = primitive.NewObjectID()
@@ -313,7 +656,22 @@ func (s *Mongo) CreateSupportMessage(ctx context.Context, message *domain.Suppor
 	return err
 }
 func (s *Mongo) Reply(ctx context.Context, id, doctor primitive.ObjectID, reply, status string) error {
-	r, err := s.db.Collection("consultations").UpdateOne(ctx, bson.M{"_id": id, "doctor_id": doctor}, bson.M{"$set": bson.M{"reply": reply, "status": status, "updated_at": time.Now().UTC()}})
+	now := time.Now().UTC()
+	r, err := s.db.Collection("consultations").UpdateOne(ctx, bson.M{"_id": id, "doctor_id": doctor}, bson.M{"$set": bson.M{"reply": reply, "status": status, "updated_at": now}, "$push": bson.M{"messages": domain.ConsultationMessage{Sender: "doctor", Text: reply, CreatedAt: now}}})
+	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+
+func (s *Mongo) AppendConsultationMessage(ctx context.Context, id, user primitive.ObjectID, role domain.Role, message domain.ConsultationMessage) error {
+	filter := bson.M{"_id": id}
+	if role == domain.RoleDoctor {
+		filter["doctor_id"] = user
+	} else {
+		filter["patient_id"] = user
+	}
+	r, err := s.db.Collection("consultations").UpdateOne(ctx, filter, bson.M{"$push": bson.M{"messages": message}, "$set": bson.M{"updated_at": message.CreatedAt}})
 	if err == nil && r.MatchedCount == 0 {
 		return mongo.ErrNoDocuments
 	}
@@ -344,15 +702,18 @@ func (s *Mongo) Schedule(ctx context.Context, doctor primitive.ObjectID, from, t
 	return out, nil
 }
 
-func (s *Mongo) ReplaceSchedule(ctx context.Context, doctor primitive.ObjectID, from, to time.Time, starts []time.Time) error {
+func (s *Mongo) ReplaceSchedule(ctx context.Context, doctor primitive.ObjectID, from, to time.Time, starts []time.Time, slotMinutes int) error {
 	collection := s.db.Collection("schedule_slots")
 	_, err := collection.DeleteMany(ctx, bson.M{"doctor_id": doctor, "start_at": bson.M{"$gte": from, "$lt": to}, "status": "available"})
 	if err != nil {
 		return err
 	}
 	now := time.Now().UTC()
+	if slotMinutes != 15 && slotMinutes != 20 && slotMinutes != 30 && slotMinutes != 60 {
+		slotMinutes = 30
+	}
 	for _, start := range starts {
-		_, err = collection.UpdateOne(ctx, bson.M{"doctor_id": doctor, "start_at": start, "status": bson.M{"$ne": "booked"}}, bson.M{"$set": bson.M{"end_at": start.Add(30 * time.Minute), "status": "available", "updated_at": now}, "$setOnInsert": bson.M{"_id": primitive.NewObjectID(), "doctor_id": doctor}}, options.Update().SetUpsert(true))
+		_, err = collection.UpdateOne(ctx, bson.M{"doctor_id": doctor, "start_at": start, "status": bson.M{"$ne": "booked"}}, bson.M{"$set": bson.M{"end_at": start.Add(time.Duration(slotMinutes) * time.Minute), "status": "available", "updated_at": now}, "$setOnInsert": bson.M{"_id": primitive.NewObjectID(), "doctor_id": doctor}}, options.Update().SetUpsert(true))
 		if err != nil {
 			return err
 		}
@@ -450,7 +811,7 @@ func (s *Mongo) ClinicalArticles(ctx context.Context, includeDrafts bool) ([]dom
 		return nil, err
 	}
 	defer cur.Close(ctx)
-	var out []domain.ClinicalArticle
+	out := make([]domain.ClinicalArticle, 0)
 	err = cur.All(ctx, &out)
 	return out, err
 }

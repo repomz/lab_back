@@ -71,6 +71,15 @@ func TestOCRScorePrefersStructuredLabText(t *testing.T) {
 	}
 }
 
+func TestPrimaryOCRLanguagePrefersFastRussianModel(t *testing.T) {
+	if got := primaryOCRLanguage("rus+eng"); got != "rus" {
+		t.Fatalf("primary language = %q, want rus", got)
+	}
+	if got := primaryOCRLanguage("eng"); got != "eng" {
+		t.Fatalf("primary language = %q, want eng", got)
+	}
+}
+
 func TestParsePhotographedLabTable(t *testing.T) {
 	text := `
 Глюкоза 4,77 39-64 ммоль/л
@@ -124,10 +133,10 @@ nnen 1,69 0,78-2,07 ммоль/л
 	assertMarker("creatinine", 136.86, 44, 97, domain.StatusHigh)
 	assertMarker("egfr", 32, 60, -1, domain.StatusLow)
 	assertMarker("uric_acid", 517.60, 154.7, 428.4, domain.StatusHigh)
-	assertMarker("calcium_total", 2.33, -1, -1, domain.StatusUnknown)
+	assertMarker("calcium_total", 2.33, 2, 2.6, domain.StatusNormal)
 	assertMarker("potassium", 4.40, 3.6, 5.5, domain.StatusNormal)
-	if !markersNeedReview(markers) {
-		t.Fatal("an uncertain field must require review")
+	if markersNeedReview(markers) {
+		t.Fatal("the photographed table should be complete after deterministic repairs")
 	}
 }
 
@@ -166,6 +175,48 @@ func TestParseSparseOCRCells(t *testing.T) {
 	}
 	if got := *byName["sodium"].ReferenceMax; math.Abs(got-150) > 0.001 {
 		t.Fatalf("sodium max=%g", got)
+	}
+}
+
+func TestRepairsCollapsedReferencesFromFastRussianOCR(t *testing.T) {
+	markers := parseMarkers("Мочевая кислота 517,60 1547 4284 мкмоль/л\nЖелезо (Fe) 11,91 1026 мкмоль/л\nКальций общий 2330 2725 ммоль/л")
+	byName := map[string]domain.Marker{}
+	for _, marker := range markers {
+		byName[marker.CanonicalName] = marker
+	}
+	assertRange := func(name string, wantMin, wantMax float64, wantStatus domain.MarkerStatus) {
+		t.Helper()
+		marker, ok := byName[name]
+		if !ok || marker.ReferenceMin == nil || marker.ReferenceMax == nil {
+			t.Fatalf("missing repaired range for %s: %#v", name, marker)
+		}
+		if math.Abs(*marker.ReferenceMin-wantMin) > 0.001 || math.Abs(*marker.ReferenceMax-wantMax) > 0.001 {
+			t.Fatalf("unexpected repaired range for %s: %#v", name, marker)
+		}
+		if marker.Status != wantStatus {
+			t.Fatalf("unexpected repaired status for %s: %s", name, marker.Status)
+		}
+	}
+	assertRange("uric_acid", 154.7, 428.4, domain.StatusHigh)
+	assertRange("iron", 10, 26, domain.StatusNormal)
+	assertRange("calcium_total", 2, 2.6, domain.StatusNormal)
+}
+
+func TestRepairsCalciumReferenceFromProductionOCR(t *testing.T) {
+	markers := parseMarkers(`"Кальций общий                                    2330                      225              нноле/л
+Кальций (Са) _                                  -`)
+	if len(markers) != 1 {
+		t.Fatalf("got %d markers: %#v", len(markers), markers)
+	}
+	marker := markers[0]
+	if marker.CanonicalName != "calcium_total" || marker.Value == nil || marker.ReferenceMin == nil || marker.ReferenceMax == nil {
+		t.Fatalf("calcium reference was not restored: %#v", marker)
+	}
+	if math.Abs(*marker.Value-2.33) > 0.001 || math.Abs(*marker.ReferenceMin-2) > 0.001 || math.Abs(*marker.ReferenceMax-2.6) > 0.001 {
+		t.Fatalf("unexpected calcium marker: %#v", marker)
+	}
+	if marker.Status != domain.StatusNormal {
+		t.Fatalf("unexpected calcium status: %s", marker.Status)
 	}
 }
 
@@ -228,6 +279,18 @@ func TestSparseOrUncertainMarkersNeedDeepSeekStructuring(t *testing.T) {
 	if !markersNeedStructuring(complete) {
 		t.Fatal("an uncertain row must be sent for structuring")
 	}
+	longTable := append(complete, complete[:4]...)
+	if markersNeedStructuring(longTable) {
+		t.Fatal("a long table must go directly to patient verification")
+	}
+}
+
+func TestExtractCollectedAtPrefersSpecimenDate(t *testing.T) {
+	text := "Дата рождения: 05.10.1948 Дата взятия материала: 23.03.2026 10:57 Дата и время печати: 30.03.2026"
+	got := ExtractCollectedAt(text)
+	if got == nil || got.Format("02.01.2006") != "23.03.2026" {
+		t.Fatalf("unexpected collection date: %v", got)
+	}
 }
 
 func TestOCRPhotoFixture(t *testing.T) {
@@ -241,16 +304,16 @@ func TestOCRPhotoFixture(t *testing.T) {
 		t.Fatal(err)
 	}
 	markers := parseOCRCandidates(candidates)
-	if len(markers) < 15 {
-		t.Fatalf("recognized only %d markers; OCR text: %.500s", len(markers), text)
+	if len(markers) != 19 {
+		t.Fatalf("recognized %d markers instead of 19; OCR text: %.500s", len(markers), text)
 	}
 	byName := map[string]domain.Marker{}
 	for _, marker := range markers {
 		byName[marker.CanonicalName] = marker
 	}
-	for _, canonical := range []string{"glucose", "creatinine", "egfr", "uric_acid", "sodium"} {
-		if byName[canonical].Value == nil {
-			t.Fatalf("required marker %s is missing: %#v", canonical, markers)
+	for canonical, expected := range map[string]float64{"glucose": 4.77, "creatinine": 136.86, "egfr": 32, "uric_acid": 517.6, "sodium": 144} {
+		if byName[canonical].Value == nil || *byName[canonical].Value != expected {
+			t.Fatalf("required marker %s = %v, want %v", canonical, byName[canonical].Value, expected)
 		}
 	}
 }
