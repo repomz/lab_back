@@ -24,6 +24,10 @@ func (a *API) reportPDF(w http.ResponseWriter, r *http.Request) {
 		write(w, http.StatusNotFound, map[string]string{"error": "analysis not found"})
 		return
 	}
+	if item.Status != domain.AnalysisStatusReady {
+		write(w, http.StatusConflict, map[string]string{"error": "analysis is not ready"})
+		return
+	}
 	payload, err := buildAnalysisPDF(item)
 	if err != nil {
 		write(w, http.StatusInternalServerError, map[string]string{"error": "could not create report"})

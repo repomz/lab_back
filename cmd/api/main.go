@@ -14,6 +14,7 @@ import (
 	"github.com/repomz/lab_back/internal/auth"
 	"github.com/repomz/lab_back/internal/config"
 	"github.com/repomz/lab_back/internal/httpapi"
+	"github.com/repomz/lab_back/internal/processing"
 	"github.com/repomz/lab_back/internal/store"
 )
 
@@ -68,7 +69,10 @@ func main() {
 			}
 		}
 	}()
-	server := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.New(cfg, s, analyzer.New(cfg)), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 2 * time.Minute, WriteTimeout: 2 * time.Minute, IdleTimeout: 60 * time.Second}
+	analysisService := analyzer.New(cfg)
+	ocrQueue := processing.NewOCRQueue(cfg, s, analysisService)
+	ocrQueue.Start(ctx)
+	server := &http.Server{Addr: cfg.HTTPAddr, Handler: httpapi.New(cfg, s, analysisService), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 2 * time.Minute, WriteTimeout: 2 * time.Minute, IdleTimeout: 60 * time.Second}
 	go func() {
 		log.Printf("lab api listening on %s", cfg.HTTPAddr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -79,4 +83,5 @@ func main() {
 	shutdown, c := context.WithTimeout(context.Background(), 10*time.Second)
 	defer c()
 	_ = server.Shutdown(shutdown)
+	ocrQueue.Wait()
 }

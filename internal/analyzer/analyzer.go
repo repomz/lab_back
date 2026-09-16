@@ -28,9 +28,11 @@ type Service struct {
 }
 
 func New(cfg config.Config) *Service {
-	// Two OCR jobs saturate the two-core production host. A bounded queue keeps
-	// additional uploads from starting more ImageMagick/Tesseract processes and
-	// degrading every in-flight request at once.
+	// OCR concurrency follows the durable worker count. This keeps a small host
+	// stable and lets a larger deployment scale by configuration.
+	if cfg.OCRWorkerCount <= 0 {
+		cfg.OCRWorkerCount = 1
+	}
 	if cfg.DeepSeekRequestsPerMinute <= 0 {
 		cfg.DeepSeekRequestsPerMinute = defaultDeepSeekRequestsPerMinute
 	}
@@ -46,7 +48,7 @@ func New(cfg config.Config) *Service {
 	return &Service{
 		cfg:       cfg,
 		client:    &http.Client{Timeout: time.Duration(cfg.DeepSeekTimeoutSeconds+5) * time.Second},
-		ocrSlots:  make(chan struct{}, 2),
+		ocrSlots:  make(chan struct{}, cfg.OCRWorkerCount),
 		aiLimiter: newDeepSeekLimiter(cfg.DeepSeekRequestsPerMinute, cfg.DeepSeekRequestsPerHour, cfg.DeepSeekMaxConcurrent),
 	}
 }
@@ -70,23 +72,41 @@ func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, prof
 // RecognizeForPatient extracts a verifiable table but deliberately postpones
 // interpretation until the patient confirms the values.
 func (s *Service) RecognizeForPatient(ctx context.Context, path, mime string, profile *domain.PatientProfile) (string, []domain.Marker, string) {
+	text, markers, status, _ := s.RecognizeJob(ctx, path, mime, profile, nil)
+	return text, markers, status
+}
+
+type RecognitionProgress = func(stage string, progress int)
+
+// RecognizeJob is the durable-worker entry point. Unlike the compatibility
+// wrapper above it returns transient failures so the queue can retry them.
+func (s *Service) RecognizeJob(ctx context.Context, path, mime string, profile *domain.PatientProfile, progress RecognitionProgress) (string, []domain.Marker, string, error) {
 	started := time.Now()
+	report := func(stage string, value int) {
+		if progress != nil {
+			progress(stage, value)
+		}
+	}
 	select {
 	case s.ocrSlots <- struct{}{}:
 	case <-ctx.Done():
-		return "", []domain.Marker{}, "failed"
+		return "", []domain.Marker{}, domain.AnalysisStatusFailed, ctx.Err()
 	}
+	defer func() { <-s.ocrSlots }()
+	report(domain.ProcessingStagePreprocessing, 15)
+	report(domain.ProcessingStageRecognizing, 35)
 	text, candidates, err := s.extract(ctx, path, mime)
-	<-s.ocrSlots
 	if err != nil {
 		log.Printf("recognition failed file=%s stage=ocr elapsed=%s error=%v", filepath.Base(path), time.Since(started).Round(time.Millisecond), err)
-		return "", []domain.Marker{}, "failed"
+		return "", []domain.Marker{}, domain.AnalysisStatusFailed, err
 	}
 	ocrFinished := time.Now()
+	report(domain.ProcessingStageStructuring, 76)
 	markers := parseOCRCandidates(candidates)
 	if s.cfg.DeepSeekAPIKey != "" && strings.TrimSpace(text) != "" {
 		aiCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		if markersNeedStructuring(markers) {
+			report(domain.ProcessingStageStructuring, 84)
 			m, _, e := s.deepSeek(aiCtx, text, profile)
 			if e != nil {
 				log.Printf("deepseek structuring failed: %v", e)
@@ -98,12 +118,13 @@ func (s *Service) RecognizeForPatient(ctx context.Context, path, mime string, pr
 		}
 		cancel()
 	}
-	status := "awaiting_confirmation"
+	report(domain.ProcessingStageFinalizing, 94)
+	status := domain.AnalysisStatusAwaitingConfirmation
 	if len(markers) == 0 {
-		status = "needs_review"
+		status = domain.AnalysisStatusNeedsReview
 	}
 	log.Printf("recognition complete file=%s ocr=%s total=%s markers=%d status=%s", filepath.Base(path), ocrFinished.Sub(started).Round(time.Millisecond), time.Since(started).Round(time.Millisecond), len(markers), status)
-	return text, markers, status
+	return text, markers, status, nil
 }
 
 func (s *Service) ReviewMarkersForPatient(ctx context.Context, markers []domain.Marker, profile *domain.PatientProfile) domain.AIReview {
@@ -1100,6 +1121,7 @@ type PatientHealthSummaryResult struct {
 }
 
 func (s *Service) PatientHealthSummary(ctx context.Context, patient domain.User, analyses []domain.Analysis) PatientHealthSummaryResult {
+	analyses = completedAnalyses(analyses)
 	if len(analyses) == 0 {
 		return PatientHealthSummaryResult{Summary: "После загрузки и распознавания анализов здесь появится общее резюме вашего текущего состояния и динамики показателей."}
 	}
@@ -1201,6 +1223,7 @@ func (s *Service) DoctorChat(ctx context.Context, messages []domain.AIMessage) (
 }
 
 func compactAnalysisContext(analyses []domain.Analysis) string {
+	analyses = completedAnalyses(analyses)
 	if len(analyses) == 0 {
 		return "нет данных"
 	}
@@ -1222,6 +1245,16 @@ func compactAnalysisContext(analyses []domain.Analysis) string {
 		lines = append(lines, analysis.CreatedAt.Format("02.01.2006")+" "+analysis.Title+": "+strings.Join(markers, ", "))
 	}
 	return strings.Join(lines, "\n")
+}
+
+func completedAnalyses(analyses []domain.Analysis) []domain.Analysis {
+	completed := make([]domain.Analysis, 0, len(analyses))
+	for _, analysis := range analyses {
+		if analysis.Status == domain.AnalysisStatusReady {
+			completed = append(completed, analysis)
+		}
+	}
+	return completed
 }
 
 func (s *Service) completeJSON(ctx context.Context, system, user string, out any) error {

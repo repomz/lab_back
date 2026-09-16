@@ -128,24 +128,55 @@ type AIReview struct {
 	Provider           string   `bson:"provider" json:"provider"`
 }
 
+const (
+	AnalysisStatusQueued               = "queued"
+	AnalysisStatusProcessing           = "processing"
+	AnalysisStatusAwaitingConfirmation = "awaiting_confirmation"
+	AnalysisStatusNeedsReview          = "needs_review"
+	AnalysisStatusReady                = "ready"
+	AnalysisStatusFailed               = "failed"
+)
+
+const (
+	ProcessingStageQueued        = "queued"
+	ProcessingStageRetryWait     = "retry_wait"
+	ProcessingStagePreprocessing = "preprocessing"
+	ProcessingStageRecognizing   = "recognizing"
+	ProcessingStageStructuring   = "structuring"
+	ProcessingStageFinalizing    = "finalizing"
+	ProcessingStageVerification  = "verification"
+	ProcessingStageCompleted     = "completed"
+	ProcessingStageFailed        = "failed"
+)
+
 type Analysis struct {
-	ID           primitive.ObjectID   `bson:"_id,omitempty" json:"id"`
-	OwnerID      primitive.ObjectID   `bson:"owner_id" json:"owner_id"`
-	Title        string               `bson:"title" json:"title"`
-	Category     string               `bson:"category,omitempty" json:"category,omitempty"`
-	LabName      string               `bson:"lab_name,omitempty" json:"lab_name,omitempty"`
-	CollectedAt  *time.Time           `bson:"collected_at,omitempty" json:"collected_at,omitempty"`
-	OriginalName string               `bson:"original_name" json:"original_name"`
-	MimeType     string               `bson:"mime_type" json:"mime_type"`
-	StoragePath  string               `bson:"storage_path" json:"-"`
-	OCRText      string               `bson:"ocr_text,omitempty" json:"ocr_text,omitempty"`
-	Markers      []Marker             `bson:"markers" json:"markers"`
-	AIReview     AIReview             `bson:"ai_review" json:"ai_review"`
-	Status       string               `bson:"status" json:"status"`
-	SharedWith   []primitive.ObjectID `bson:"shared_with" json:"shared_with"`
-	CreatedAt    time.Time            `bson:"created_at" json:"created_at"`
-	UpdatedAt    time.Time            `bson:"updated_at" json:"updated_at"`
-	IsDeveloper  bool                 `bson:"is_developer,omitempty" json:"is_developer,omitempty"`
+	ID                    primitive.ObjectID   `bson:"_id,omitempty" json:"id"`
+	OwnerID               primitive.ObjectID   `bson:"owner_id" json:"owner_id"`
+	Title                 string               `bson:"title" json:"title"`
+	Category              string               `bson:"category,omitempty" json:"category,omitempty"`
+	LabName               string               `bson:"lab_name,omitempty" json:"lab_name,omitempty"`
+	CollectedAt           *time.Time           `bson:"collected_at,omitempty" json:"collected_at,omitempty"`
+	OriginalName          string               `bson:"original_name" json:"original_name"`
+	MimeType              string               `bson:"mime_type" json:"mime_type"`
+	StoragePath           string               `bson:"storage_path" json:"-"`
+	OCRText               string               `bson:"ocr_text,omitempty" json:"ocr_text,omitempty"`
+	Markers               []Marker             `bson:"markers" json:"markers"`
+	AIReview              AIReview             `bson:"ai_review" json:"ai_review"`
+	Status                string               `bson:"status" json:"status"`
+	ProcessingStage       string               `bson:"processing_stage,omitempty" json:"processing_stage,omitempty"`
+	ProcessingProgress    int                  `bson:"processing_progress,omitempty" json:"processing_progress,omitempty"`
+	ProcessingAttempt     int                  `bson:"processing_attempt,omitempty" json:"processing_attempt,omitempty"`
+	ProcessingError       string               `bson:"processing_error,omitempty" json:"processing_error,omitempty"`
+	ProcessingWorker      string               `bson:"processing_worker,omitempty" json:"-"`
+	ProcessingQueuedAt    *time.Time           `bson:"processing_queued_at,omitempty" json:"processing_queued_at,omitempty"`
+	ProcessingStartedAt   *time.Time           `bson:"processing_started_at,omitempty" json:"processing_started_at,omitempty"`
+	ProcessingCompletedAt *time.Time           `bson:"processing_completed_at,omitempty" json:"processing_completed_at,omitempty"`
+	ProcessingNextAttempt *time.Time           `bson:"processing_next_attempt_at,omitempty" json:"processing_next_attempt_at,omitempty"`
+	ProcessingLeaseUntil  *time.Time           `bson:"processing_lease_until,omitempty" json:"-"`
+	SharedWith            []primitive.ObjectID `bson:"shared_with" json:"shared_with"`
+	CreatedAt             time.Time            `bson:"created_at" json:"created_at"`
+	UpdatedAt             time.Time            `bson:"updated_at" json:"updated_at"`
+	IsDeveloper           bool                 `bson:"is_developer,omitempty" json:"is_developer,omitempty"`
 }
 
 type Consultation struct {

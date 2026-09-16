@@ -760,16 +760,20 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	patient, _ := a.store.UserByID(r.Context(), u.ID)
-	text, markers, status := a.analyzer.RecognizeForPatient(r.Context(), path, mime, patient.PatientProfile)
-	category := analyzer.ClassifyAnalysis(markers, text)
-	item := domain.Analysis{OwnerID: u.ID, Title: category, Category: category, CollectedAt: analyzer.ExtractCollectedAt(text), OriginalName: filepath.Base(header.Filename), MimeType: mime, StoragePath: path, OCRText: text, Markers: markers, AIReview: domain.AIReview{}, Status: status, SharedWith: []primitive.ObjectID{}, IsDeveloper: patient.IsDeveloper}
-	item.ID = id
+	queuedAt := time.Now().UTC()
+	item := domain.Analysis{
+		ID: id, OwnerID: u.ID, Title: "Новый анализ", Category: "Обрабатывается",
+		OriginalName: filepath.Base(header.Filename), MimeType: mime, StoragePath: path,
+		Markers: []domain.Marker{}, AIReview: domain.AIReview{}, Status: domain.AnalysisStatusQueued,
+		ProcessingStage: domain.ProcessingStageQueued, ProcessingProgress: 5, ProcessingQueuedAt: &queuedAt, ProcessingNextAttempt: &queuedAt,
+		SharedWith: []primitive.ObjectID{}, IsDeveloper: patient.IsDeveloper,
+	}
 	if e = a.store.CreateAnalysis(r.Context(), &item); e != nil {
 		_ = os.Remove(path)
 		write(w, 500, map[string]string{"error": "could not save analysis"})
 		return
 	}
-	write(w, 201, item)
+	write(w, http.StatusAccepted, item)
 }
 func parseID(raw string) (primitive.ObjectID, error) { return primitive.ObjectIDFromHex(raw) }
 func canRead(a domain.Analysis, u actor) bool {
@@ -878,15 +882,16 @@ func (a *API) reprocess(w http.ResponseWriter, r *http.Request) {
 		write(w, 404, map[string]string{"error": "original file not found"})
 		return
 	}
-	patient, _ := a.store.UserByID(r.Context(), u.ID)
-	text, markers, status := a.analyzer.RecognizeForPatient(r.Context(), item.StoragePath, item.MimeType, patient.PatientProfile)
-	collectedAt := analyzer.ExtractCollectedAt(text)
-	if err = a.store.UpdateAnalysisRecognition(r.Context(), id, u.ID, text, markers, domain.AIReview{}, status, collectedAt); err != nil {
-		write(w, 500, map[string]string{"error": "could not update recognition"})
+	if item.Status == domain.AnalysisStatusQueued || item.Status == domain.AnalysisStatusProcessing {
+		write(w, http.StatusAccepted, item)
 		return
 	}
-	item.OCRText, item.Markers, item.AIReview, item.Status, item.CollectedAt = text, markers, domain.AIReview{}, status, collectedAt
-	write(w, 200, item)
+	item, err = a.store.QueueAnalysis(r.Context(), id, u.ID)
+	if err != nil {
+		write(w, 500, map[string]string{"error": "could not queue recognition"})
+		return
+	}
+	write(w, http.StatusAccepted, item)
 }
 
 func (a *API) confirmAnalysis(w http.ResponseWriter, r *http.Request) {
@@ -909,6 +914,10 @@ func (a *API) confirmAnalysis(w http.ResponseWriter, r *http.Request) {
 		write(w, 200, item)
 		return
 	}
+	if item.Status == domain.AnalysisStatusQueued || item.Status == domain.AnalysisStatusProcessing {
+		write(w, http.StatusConflict, map[string]string{"error": "analysis is still being processed"})
+		return
+	}
 	var in struct {
 		Markers []domain.Marker `json:"markers"`
 	}
@@ -927,7 +936,7 @@ func (a *API) confirmAnalysis(w http.ResponseWriter, r *http.Request) {
 		write(w, 500, map[string]string{"error": "could not confirm analysis"})
 		return
 	}
-	item.Markers, item.AIReview, item.Status = markers, review, "ready"
+	item.Markers, item.AIReview, item.Status, item.ProcessingStage, item.ProcessingProgress = markers, review, domain.AnalysisStatusReady, domain.ProcessingStageCompleted, 100
 	write(w, 200, item)
 }
 func (a *API) share(w http.ResponseWriter, r *http.Request) {

@@ -38,6 +38,7 @@ func Connect(ctx context.Context, uri, database string) (*Mongo, error) {
 		{"analyses", []mongo.IndexModel{
 			{Keys: bson.D{{Key: "owner_id", Value: 1}, {Key: "created_at", Value: -1}}},
 			{Keys: bson.D{{Key: "shared_with", Value: 1}, {Key: "created_at", Value: -1}}},
+			{Keys: bson.D{{Key: "status", Value: 1}, {Key: "processing_next_attempt_at", Value: 1}, {Key: "created_at", Value: 1}}},
 		}},
 		{"usage_events", []mongo.IndexModel{{Keys: bson.D{{Key: "kind", Value: 1}, {Key: "created_at", Value: -1}}}}},
 		{"consultations", []mongo.IndexModel{
@@ -225,12 +226,121 @@ func (s *Mongo) Doctors(ctx context.Context, specialty, city string) ([]domain.U
 	return out, err
 }
 func (s *Mongo) CreateAnalysis(ctx context.Context, a *domain.Analysis) error {
-	a.ID = primitive.NewObjectID()
+	if a.ID.IsZero() {
+		a.ID = primitive.NewObjectID()
+	}
 	now := time.Now().UTC()
 	a.CreatedAt = now
 	a.UpdatedAt = now
 	_, err := s.db.Collection("analyses").InsertOne(ctx, a)
 	return err
+}
+
+func (s *Mongo) RecoverExpiredOCRJobs(ctx context.Context, maxAttempts int) error {
+	now := time.Now().UTC()
+	collection := s.db.Collection("analyses")
+	expired := bson.M{"status": domain.AnalysisStatusProcessing, "processing_lease_until": bson.M{"$lte": now}}
+	if _, err := collection.UpdateMany(ctx, bson.M{"$and": []bson.M{expired, {"processing_attempt": bson.M{"$gte": maxAttempts}}}}, bson.M{
+		"$set":   bson.M{"status": domain.AnalysisStatusFailed, "processing_stage": domain.ProcessingStageFailed, "processing_progress": 100, "processing_error": "Не удалось распознать документ после нескольких попыток.", "updated_at": now},
+		"$unset": bson.M{"processing_worker": "", "processing_lease_until": "", "processing_next_attempt_at": ""},
+	}); err != nil {
+		return err
+	}
+	_, err := collection.UpdateMany(ctx, bson.M{"$and": []bson.M{expired, {"$or": []bson.M{{"processing_attempt": bson.M{"$lt": maxAttempts}}, {"processing_attempt": bson.M{"$exists": false}}}}}}, bson.M{
+		"$set":   bson.M{"status": domain.AnalysisStatusQueued, "processing_stage": domain.ProcessingStageRetryWait, "processing_progress": 5, "processing_next_attempt_at": now, "processing_error": "Обработка была прервана и будет продолжена.", "updated_at": now},
+		"$unset": bson.M{"processing_worker": "", "processing_lease_until": ""},
+	})
+	return err
+}
+
+func (s *Mongo) ClaimOCRJob(ctx context.Context, worker string, lease time.Duration, maxAttempts int) (domain.Analysis, error) {
+	now := time.Now().UTC()
+	filter := bson.M{
+		"status": domain.AnalysisStatusQueued,
+		"$and": []bson.M{
+			{"$or": []bson.M{{"processing_next_attempt_at": bson.M{"$exists": false}}, {"processing_next_attempt_at": bson.M{"$lte": now}}}},
+			{"$or": []bson.M{{"processing_attempt": bson.M{"$exists": false}}, {"processing_attempt": bson.M{"$lt": maxAttempts}}}},
+		},
+	}
+	update := bson.M{
+		"$set":   bson.M{"status": domain.AnalysisStatusProcessing, "processing_stage": domain.ProcessingStagePreprocessing, "processing_progress": 10, "processing_worker": worker, "processing_started_at": now, "processing_lease_until": now.Add(lease), "processing_error": "", "updated_at": now},
+		"$inc":   bson.M{"processing_attempt": 1},
+		"$unset": bson.M{"processing_next_attempt_at": "", "processing_completed_at": ""},
+	}
+	var job domain.Analysis
+	err := s.db.Collection("analyses").FindOneAndUpdate(ctx, filter, update, options.FindOneAndUpdate().SetSort(bson.D{{Key: "processing_queued_at", Value: 1}, {Key: "created_at", Value: 1}}).SetReturnDocument(options.After)).Decode(&job)
+	return job, err
+}
+
+func (s *Mongo) UpdateOCRJobProgress(ctx context.Context, id primitive.ObjectID, worker, stage string, progress int, lease time.Duration) error {
+	now := time.Now().UTC()
+	r, err := s.db.Collection("analyses").UpdateOne(ctx,
+		bson.M{"_id": id, "status": domain.AnalysisStatusProcessing, "processing_worker": worker},
+		bson.M{"$set": bson.M{"processing_stage": stage, "processing_progress": progress, "processing_lease_until": now.Add(lease), "updated_at": now}},
+	)
+	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+
+func (s *Mongo) CompleteOCRJob(ctx context.Context, job domain.Analysis, worker, text string, markers []domain.Marker, status, title, category string, collectedAt *time.Time) error {
+	now := time.Now().UTC()
+	set := bson.M{"ocr_text": text, "markers": markers, "ai_review": domain.AIReview{}, "status": status, "title": title, "category": category, "processing_stage": domain.ProcessingStageVerification, "processing_progress": 100, "processing_error": "", "processing_completed_at": now, "updated_at": now}
+	if collectedAt != nil {
+		set["collected_at"] = collectedAt
+	}
+	r, err := s.db.Collection("analyses").UpdateOne(ctx,
+		bson.M{"_id": job.ID, "status": domain.AnalysisStatusProcessing, "processing_worker": worker},
+		bson.M{"$set": set, "$unset": bson.M{"processing_worker": "", "processing_lease_until": "", "processing_next_attempt_at": ""}},
+	)
+	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+
+func (s *Mongo) RetryOCRJob(ctx context.Context, id primitive.ObjectID, worker string, next time.Time, message string, final bool) error {
+	now := time.Now().UTC()
+	set := bson.M{"updated_at": now, "processing_error": message}
+	unset := bson.M{"processing_worker": "", "processing_lease_until": ""}
+	if final {
+		set["status"] = domain.AnalysisStatusFailed
+		set["processing_stage"] = domain.ProcessingStageFailed
+		set["processing_progress"] = 100
+		set["processing_completed_at"] = now
+		unset["processing_next_attempt_at"] = ""
+	} else {
+		set["status"] = domain.AnalysisStatusQueued
+		set["processing_stage"] = domain.ProcessingStageRetryWait
+		set["processing_progress"] = 5
+		set["processing_next_attempt_at"] = next
+	}
+	r, err := s.db.Collection("analyses").UpdateOne(ctx, bson.M{"_id": id, "processing_worker": worker}, bson.M{"$set": set, "$unset": unset})
+	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+
+func (s *Mongo) ReleaseOCRJob(ctx context.Context, id primitive.ObjectID, worker string) error {
+	now := time.Now().UTC()
+	_, err := s.db.Collection("analyses").UpdateOne(ctx, bson.M{"_id": id, "processing_worker": worker}, bson.M{
+		"$set":   bson.M{"status": domain.AnalysisStatusQueued, "processing_stage": domain.ProcessingStageQueued, "processing_progress": 5, "processing_next_attempt_at": now, "updated_at": now},
+		"$inc":   bson.M{"processing_attempt": -1},
+		"$unset": bson.M{"processing_worker": "", "processing_lease_until": ""},
+	})
+	return err
+}
+
+func (s *Mongo) QueueAnalysis(ctx context.Context, id, owner primitive.ObjectID) (domain.Analysis, error) {
+	now := time.Now().UTC()
+	var item domain.Analysis
+	err := s.db.Collection("analyses").FindOneAndUpdate(ctx, bson.M{"_id": id, "owner_id": owner}, bson.M{
+		"$set":   bson.M{"status": domain.AnalysisStatusQueued, "processing_stage": domain.ProcessingStageQueued, "processing_progress": 5, "processing_attempt": 0, "processing_error": "", "processing_queued_at": now, "processing_next_attempt_at": now, "ocr_text": "", "markers": []domain.Marker{}, "ai_review": domain.AIReview{}, "updated_at": now},
+		"$unset": bson.M{"processing_worker": "", "processing_started_at": "", "processing_completed_at": "", "processing_lease_until": ""},
+	}, options.FindOneAndUpdate().SetReturnDocument(options.After)).Decode(&item)
+	return item, err
 }
 
 func (s *Mongo) RecordUsageEvent(ctx context.Context, kind string, user domain.User) error {
@@ -518,9 +628,10 @@ func (s *Mongo) UpdateAnalysisRecognition(ctx context.Context, id, owner primiti
 }
 
 func (s *Mongo) ConfirmAnalysis(ctx context.Context, id, owner primitive.ObjectID, markers []domain.Marker, review domain.AIReview) error {
+	now := time.Now().UTC()
 	r, err := s.db.Collection("analyses").UpdateOne(ctx,
 		bson.M{"_id": id, "owner_id": owner},
-		bson.M{"$set": bson.M{"markers": markers, "ai_review": review, "status": "ready", "updated_at": time.Now().UTC()}},
+		bson.M{"$set": bson.M{"markers": markers, "ai_review": review, "status": domain.AnalysisStatusReady, "processing_stage": domain.ProcessingStageCompleted, "processing_progress": 100, "processing_completed_at": now, "updated_at": now}},
 	)
 	if err == nil && r.MatchedCount == 0 {
 		return mongo.ErrNoDocuments

@@ -15,6 +15,8 @@ type Config struct {
 	DeepSeekRequestsPerMinute, DeepSeekRequestsPerHour                     int
 	DeepSeekMaxConcurrent, DeepSeekTimeoutSeconds                          int
 	AIUserRequestsPerMinute, AIUserRequestsPerHour                         int
+	OCRWorkerCount, OCRJobMaxAttempts                                      int
+	OCRJobTimeoutSeconds, OCRJobLeaseSeconds                               int
 }
 
 func Load() Config {
@@ -33,6 +35,10 @@ func Load() Config {
 		DeepSeekTimeoutSeconds:    int(envInt("DEEPSEEK_TIMEOUT_SECONDS", 45)),
 		AIUserRequestsPerMinute:   int(envInt("AI_USER_REQUESTS_PER_MINUTE", 6)),
 		AIUserRequestsPerHour:     int(envInt("AI_USER_REQUESTS_PER_HOUR", 60)),
+		OCRWorkerCount:            int(envInt("OCR_WORKER_COUNT", 1)),
+		OCRJobMaxAttempts:         int(envInt("OCR_JOB_MAX_ATTEMPTS", 3)),
+		OCRJobTimeoutSeconds:      int(envInt("OCR_JOB_TIMEOUT_SECONDS", 180)),
+		OCRJobLeaseSeconds:        int(envInt("OCR_JOB_LEASE_SECONDS", 240)),
 	}
 }
 
