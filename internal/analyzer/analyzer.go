@@ -21,16 +21,34 @@ import (
 )
 
 type Service struct {
-	cfg      config.Config
-	client   *http.Client
-	ocrSlots chan struct{}
+	cfg       config.Config
+	client    *http.Client
+	ocrSlots  chan struct{}
+	aiLimiter *deepSeekLimiter
 }
 
 func New(cfg config.Config) *Service {
 	// Two OCR jobs saturate the two-core production host. A bounded queue keeps
 	// additional uploads from starting more ImageMagick/Tesseract processes and
 	// degrading every in-flight request at once.
-	return &Service{cfg: cfg, client: &http.Client{Timeout: 60 * time.Second}, ocrSlots: make(chan struct{}, 2)}
+	if cfg.DeepSeekRequestsPerMinute <= 0 {
+		cfg.DeepSeekRequestsPerMinute = defaultDeepSeekRequestsPerMinute
+	}
+	if cfg.DeepSeekRequestsPerHour <= 0 {
+		cfg.DeepSeekRequestsPerHour = defaultDeepSeekRequestsPerHour
+	}
+	if cfg.DeepSeekMaxConcurrent <= 0 {
+		cfg.DeepSeekMaxConcurrent = defaultDeepSeekMaxConcurrent
+	}
+	if cfg.DeepSeekTimeoutSeconds <= 0 {
+		cfg.DeepSeekTimeoutSeconds = int(defaultDeepSeekTimeout / time.Second)
+	}
+	return &Service{
+		cfg:       cfg,
+		client:    &http.Client{Timeout: time.Duration(cfg.DeepSeekTimeoutSeconds+5) * time.Second},
+		ocrSlots:  make(chan struct{}, 2),
+		aiLimiter: newDeepSeekLimiter(cfg.DeepSeekRequestsPerMinute, cfg.DeepSeekRequestsPerHour, cfg.DeepSeekMaxConcurrent),
+	}
 }
 
 func (s *Service) Process(ctx context.Context, path, mime string) (string, []domain.Marker, domain.AIReview, string) {
@@ -999,33 +1017,15 @@ func (s *Service) deepSeek(ctx context.Context, text string, profile *domain.Pat
 		"response_format": map[string]string{"type": "json_object"},
 		"messages":        []msg{{"system", "Ты медицинский модуль структурирования лабораторных бланков. Верни только json-объект: markers (поля name, canonical_name, value, text_value, unit, reference_min, reference_max, reference_text, status low|normal|high|unknown) и ai_review (summary, lifestyle[], nutrition[], doctor_needed, urgency routine|soon|urgent, suggested_specialty). Summary должен быть кратким и понятным пациенту, учитывать возраст и ИМТ, отмечать отклонения и при их наличии рекомендовать профиль специалиста. Не ставь диагноз, не назначай препараты, не выдумывай отсутствующие значения. ИМТ используй только как контекст, а не как диагноз."}, {"user", profileContext + "\n\nТекст бланка:\n" + text}},
 	}
-	b, _ := json.Marshal(payload)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.cfg.DeepSeekBaseURL, "/")+"/chat/completions", bytes.NewReader(b))
-	req.Header.Set("Authorization", "Bearer "+s.cfg.DeepSeekAPIKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, e := s.client.Do(req)
+	content, e := s.requestDeepSeek(ctx, payload)
 	if e != nil {
 		return nil, domain.AIReview{}, e
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return nil, domain.AIReview{}, fmt.Errorf("deepseek status %d", resp.StatusCode)
-	}
-	var envelope struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if e = json.NewDecoder(resp.Body).Decode(&envelope); e != nil || len(envelope.Choices) == 0 {
-		return nil, domain.AIReview{}, fmt.Errorf("invalid deepseek response")
 	}
 	var out struct {
 		Markers  []domain.Marker `json:"markers"`
 		AIReview domain.AIReview `json:"ai_review"`
 	}
-	if e = json.Unmarshal([]byte(envelope.Choices[0].Message.Content), &out); e != nil {
+	if e = json.Unmarshal([]byte(content), &out); e != nil {
 		return nil, domain.AIReview{}, e
 	}
 	out.AIReview.Provider = "deepseek"
@@ -1237,30 +1237,9 @@ func (s *Service) completeJSON(ctx context.Context, system, user string, out any
 		"response_format": map[string]string{"type": "json_object"},
 		"messages":        []msg{{"system", system}, {"user", user}},
 	}
-	b, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(s.cfg.DeepSeekBaseURL, "/")+"/chat/completions", bytes.NewReader(b))
+	content, err := s.requestDeepSeek(ctx, payload)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+s.cfg.DeepSeekAPIKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("deepseek status %d", resp.StatusCode)
-	}
-	var envelope struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err = json.NewDecoder(resp.Body).Decode(&envelope); err != nil || len(envelope.Choices) == 0 {
-		return fmt.Errorf("invalid deepseek response")
-	}
-	return json.Unmarshal([]byte(envelope.Choices[0].Message.Content), out)
+	return json.Unmarshal([]byte(content), out)
 }

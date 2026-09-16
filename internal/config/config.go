@@ -12,6 +12,9 @@ type Config struct {
 	AdminLogin, AdminPIN                                                   string
 	CORSOrigins                                                            []string
 	MaxUploadMB                                                            int64
+	DeepSeekRequestsPerMinute, DeepSeekRequestsPerHour                     int
+	DeepSeekMaxConcurrent, DeepSeekTimeoutSeconds                          int
+	AIUserRequestsPerMinute, AIUserRequestsPerHour                         int
 }
 
 func Load() Config {
@@ -23,7 +26,13 @@ func Load() Config {
 		DeepSeekModel: env("DEEPSEEK_MODEL", "deepseek-v4-flash"), OCRMode: env("OCR_MODE", "local"),
 		TesseractLang: env("TESSERACT_LANG", "rus+eng"), CORSOrigins: strings.Split(env("CORS_ORIGINS", "http://localhost:8081"), ","),
 		AdminLogin: strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_LOGIN"))), AdminPIN: strings.TrimSpace(os.Getenv("ADMIN_PIN")),
-		MaxUploadMB: envInt("MAX_UPLOAD_MB", 20),
+		MaxUploadMB:               envInt("MAX_UPLOAD_MB", 20),
+		DeepSeekRequestsPerMinute: int(envInt("DEEPSEEK_REQUESTS_PER_MINUTE", 30)),
+		DeepSeekRequestsPerHour:   int(envInt("DEEPSEEK_REQUESTS_PER_HOUR", 300)),
+		DeepSeekMaxConcurrent:     int(envInt("DEEPSEEK_MAX_CONCURRENT", 2)),
+		DeepSeekTimeoutSeconds:    int(envInt("DEEPSEEK_TIMEOUT_SECONDS", 45)),
+		AIUserRequestsPerMinute:   int(envInt("AI_USER_REQUESTS_PER_MINUTE", 6)),
+		AIUserRequestsPerHour:     int(envInt("AI_USER_REQUESTS_PER_HOUR", 60)),
 	}
 }
 

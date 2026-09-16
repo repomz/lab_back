@@ -24,9 +24,10 @@ import (
 )
 
 type API struct {
-	cfg      config.Config
-	store    *store.Mongo
-	analyzer *analyzer.Service
+	cfg       config.Config
+	store     *store.Mongo
+	analyzer  *analyzer.Service
+	aiLimiter *aiUserLimiter
 }
 type actor struct {
 	ID   primitive.ObjectID
@@ -37,7 +38,7 @@ type contextKey string
 const actorKey contextKey = "actor"
 
 func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
-	api := &API{cfg: cfg, store: s, analyzer: a}
+	api := &API{cfg: cfg, store: s, analyzer: a, aiLimiter: newAIUserLimiter(cfg.AIUserRequestsPerMinute, cfg.AIUserRequestsPerHour)}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, api.cors)
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ok"}) })
@@ -61,7 +62,7 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Get("/api/v1/admin/stats", api.appStats)
 		r.Post("/api/v1/admin/impersonate", api.adminImpersonate)
 		r.Get("/api/v1/analyses", api.analyses)
-		r.Get("/api/v1/me/health-summary", api.healthSummary)
+		r.With(api.limitAIRequests).Get("/api/v1/me/health-summary", api.healthSummary)
 		r.Post("/api/v1/analyses", api.upload)
 		r.Get("/api/v1/analyses/{id}", api.analysis)
 		r.Get("/api/v1/analyses/{id}/file", api.file)
@@ -72,13 +73,13 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Post("/api/v1/analyses/{id}/share", api.share)
 		r.Get("/api/v1/consultations", api.consultations)
 		r.Post("/api/v1/consultations", api.createConsultation)
-		r.Post("/api/v1/consultations/ai", api.createAIConsultation)
+		r.With(api.limitAIRequests).Post("/api/v1/consultations/ai", api.createAIConsultation)
 		r.Patch("/api/v1/consultations/{id}", api.reply)
 		r.Post("/api/v1/consultations/{id}/messages", api.consultationMessage)
 		r.Get("/api/v1/support/messages", api.supportMessages)
 		r.Post("/api/v1/support/messages", api.createSupportMessage)
-		r.Post("/api/v1/recommendations/{kind}", api.recommendation)
-		r.Post("/api/v1/clinical-assist", api.clinicalAssist)
+		r.With(api.limitAIRequests).Post("/api/v1/recommendations/{kind}", api.recommendation)
+		r.With(api.limitAIRequests).Post("/api/v1/clinical-assist", api.clinicalAssist)
 		r.Get("/api/v1/doctors/{id}/schedule", api.schedule)
 		r.Put("/api/v1/doctor/schedule", api.replaceSchedule)
 		r.Get("/api/v1/patients/{id}/notes", api.patientNotes)
@@ -88,7 +89,7 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Get("/api/v1/ai/chats/{id}", api.aiChat)
 		r.Patch("/api/v1/ai/chats/{id}", api.renameAIChat)
 		r.Delete("/api/v1/ai/chats/{id}", api.deleteAIChat)
-		r.Post("/api/v1/ai/chats/{id}/messages", api.aiMessage)
+		r.With(api.limitAIRequests).Post("/api/v1/ai/chats/{id}/messages", api.aiMessage)
 		r.Get("/api/v1/articles", api.articleList)
 		r.Get("/api/v1/articles/{id}", api.articleDetail)
 		r.Post("/api/v1/articles", api.createArticle)
@@ -655,6 +656,10 @@ func (a *API) clinicalAssist(w http.ResponseWriter, r *http.Request) {
 		write(w, 422, map[string]string{"error": "patient and clinical data are required"})
 		return
 	}
+	if len([]rune(in.Objective))+len([]rune(in.Clinical)) > 12000 {
+		write(w, 422, map[string]string{"error": "clinical data is too long"})
+		return
+	}
 	patientID, err := parseID(in.PatientID)
 	if err != nil {
 		write(w, 400, map[string]string{"error": "invalid patient id"})
@@ -672,7 +677,7 @@ func (a *API) clinicalAssist(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := a.analyzer.ClinicalAssist(r.Context(), patient, in.Objective, in.Clinical, analyses)
 	if err != nil {
-		write(w, 502, map[string]string{"error": "clinical assistant is temporarily unavailable"})
+		writeAIServiceError(w, err, 502, "clinical assistant is temporarily unavailable")
 		return
 	}
 	write(w, 200, result)
@@ -898,6 +903,10 @@ func (a *API) confirmAnalysis(w http.ResponseWriter, r *http.Request) {
 	item, err := a.store.Analysis(r.Context(), id)
 	if err != nil || item.OwnerID != u.ID {
 		write(w, 404, map[string]string{"error": "analysis not found"})
+		return
+	}
+	if item.Status == "ready" {
+		write(w, 200, item)
 		return
 	}
 	var in struct {
@@ -1149,7 +1158,7 @@ func (a *API) createAIConsultation(w http.ResponseWriter, r *http.Request) {
 	analyses, _ := a.store.AnalysesFor(r.Context(), u.ID, u.Role)
 	result, err := a.analyzer.SymptomConsultation(r.Context(), patient.PatientProfile, in.Question, analyses)
 	if err != nil {
-		write(w, 503, map[string]string{"error": "ИИ-консультация временно недоступна"})
+		writeAIServiceError(w, err, 503, "ИИ-консультация временно недоступна")
 		return
 	}
 	c := domain.Consultation{PatientID: u.ID, Source: "ai", Title: result.Title, Specialty: result.Specialty, Question: strings.TrimSpace(in.Question), Reply: result.Answer, Status: "answered"}
@@ -1415,6 +1424,10 @@ func (a *API) createAIChat(w http.ResponseWriter, r *http.Request) {
 	var in struct{ Title string }
 	_ = decode(r, &in)
 	title := strings.TrimSpace(in.Title)
+	if len([]rune(title)) > 120 {
+		write(w, 422, map[string]string{"error": "title is too long"})
+		return
+	}
 	if title == "" {
 		title = time.Now().Format("02.01.2006 · 15:04")
 	}
@@ -1449,7 +1462,7 @@ func (a *API) renameAIChat(w http.ResponseWriter, r *http.Request) {
 	}
 	id, e := parseID(chi.URLParam(r, "id"))
 	var in struct{ Title string }
-	if e != nil || decode(r, &in) != nil || strings.TrimSpace(in.Title) == "" {
+	if e != nil || decode(r, &in) != nil || strings.TrimSpace(in.Title) == "" || len([]rune(strings.TrimSpace(in.Title))) > 120 {
 		write(w, 422, map[string]string{"error": "invalid title"})
 		return
 	}
@@ -1478,7 +1491,7 @@ func (a *API) aiMessage(w http.ResponseWriter, r *http.Request) {
 	}
 	id, e := parseID(chi.URLParam(r, "id"))
 	var in struct{ Content string }
-	if e != nil || decode(r, &in) != nil || strings.TrimSpace(in.Content) == "" {
+	if e != nil || decode(r, &in) != nil || strings.TrimSpace(in.Content) == "" || len([]rune(strings.TrimSpace(in.Content))) > 4000 {
 		write(w, 422, map[string]string{"error": "message is required"})
 		return
 	}
@@ -1492,7 +1505,7 @@ func (a *API) aiMessage(w http.ResponseWriter, r *http.Request) {
 	history := append(chat.Messages, userMessage)
 	reply, e := a.analyzer.DoctorChat(r.Context(), history)
 	if e != nil {
-		write(w, 503, map[string]string{"error": "AI temporarily unavailable"})
+		writeAIServiceError(w, e, 503, "AI temporarily unavailable")
 		return
 	}
 	assistant := domain.AIMessage{Role: "assistant", Content: reply, CreatedAt: time.Now().UTC()}
