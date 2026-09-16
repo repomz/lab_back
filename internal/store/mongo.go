@@ -17,6 +17,10 @@ import (
 
 type Mongo struct{ db *mongo.Database }
 
+func (s *Mongo) Ping(ctx context.Context) error {
+	return s.db.Client().Ping(ctx, nil)
+}
+
 func Connect(ctx context.Context, uri, database string) (*Mongo, error) {
 	c, err := mongo.Connect(ctx, options.Client().ApplyURI(uri))
 	if err != nil {

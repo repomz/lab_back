@@ -9,7 +9,7 @@ cp .env.example .env
 docker compose -f ../lab_deploy/compose.yaml up --build
 ```
 
-API: `http://localhost:8080`, проверка: `GET /health`.
+API: `http://localhost:8080`, проверка: `GET /health`. Endpoint выполняет ограниченный по времени MongoDB ping и возвращает `503`, если обязательная база данных недоступна.
 
 DeepSeek используется только когда задан `DEEPSEEK_API_KEY`. Без ключа остаются OCR, базовый парсер референсов и осторожная rule-based сводка. ИИ-резюме не является диагнозом; интерфейс всегда показывает этот дисклеймер.
 

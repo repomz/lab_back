@@ -41,7 +41,15 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 	api := &API{cfg: cfg, store: s, analyzer: a, aiLimiter: newAIUserLimiter(cfg.AIUserRequestsPerMinute, cfg.AIUserRequestsPerHour)}
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID, middleware.RealIP, middleware.Recoverer, api.cors)
-	r.Get("/health", func(w http.ResponseWriter, r *http.Request) { write(w, 200, map[string]string{"status": "ok"}) })
+	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := api.store.Ping(ctx); err != nil {
+			write(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
+			return
+		}
+		write(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
 	r.Get("/api/v1/articles/media/{name}", api.articleMedia)
 	r.Post("/api/v1/auth/register", api.register)
 	r.Post("/api/v1/auth/login", api.login)
