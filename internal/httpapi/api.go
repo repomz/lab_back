@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -71,12 +72,12 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Post("/api/v1/admin/impersonate", api.adminImpersonate)
 		r.Get("/api/v1/analyses", api.analyses)
 		r.With(api.limitAIRequests).Get("/api/v1/me/health-summary", api.healthSummary)
-		r.Post("/api/v1/analyses", api.upload)
+		r.With(api.limitAIRequests).Post("/api/v1/analyses", api.upload)
 		r.Get("/api/v1/analyses/{id}", api.analysis)
 		r.Get("/api/v1/analyses/{id}/file", api.file)
 		r.Get("/api/v1/analyses/{id}/report.pdf", api.reportPDF)
 		r.Delete("/api/v1/analyses/{id}", api.deleteAnalysis)
-		r.Post("/api/v1/analyses/{id}/reprocess", api.reprocess)
+		r.With(api.limitAIRequests).Post("/api/v1/analyses/{id}/reprocess", api.reprocess)
 		r.Post("/api/v1/analyses/{id}/confirm", api.confirmAnalysis)
 		r.Post("/api/v1/analyses/{id}/share", api.share)
 		r.Get("/api/v1/consultations", api.consultations)
@@ -767,13 +768,28 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 		write(w, 500, map[string]string{"error": "upload failed"})
 		return
 	}
-	patient, _ := a.store.UserByID(r.Context(), u.ID)
-	queuedAt := time.Now().UTC()
+	patient, patientErr := a.store.UserByID(r.Context(), u.ID)
+	if patientErr != nil {
+		_ = os.Remove(path)
+		write(w, 404, map[string]string{"error": "patient not found"})
+		return
+	}
+	startedAt := time.Now().UTC()
+	result, analysisErr := a.analyzer.AnalyzeDocumentForPatient(r.Context(), path, mime, patient.PatientProfile)
+	if analysisErr != nil {
+		_ = os.Remove(path)
+		_ = os.Remove(dir)
+		log.Printf("synchronous document analysis failed file=%s error=%v", filepath.Base(header.Filename), analysisErr)
+		writeAIServiceError(w, analysisErr, http.StatusBadGateway, "Не удалось достоверно распознать документ. Проверьте качество фото и повторите загрузку.")
+		return
+	}
+	completedAt := time.Now().UTC()
 	item := domain.Analysis{
-		ID: id, OwnerID: u.ID, Title: "Новый анализ", Category: "Обрабатывается",
+		ID: id, OwnerID: u.ID, Title: result.Title, Category: result.Category, CollectedAt: result.CollectedAt,
 		OriginalName: filepath.Base(header.Filename), MimeType: mime, StoragePath: path,
-		Markers: []domain.Marker{}, AIReview: domain.AIReview{}, Status: domain.AnalysisStatusQueued,
-		ProcessingStage: domain.ProcessingStageQueued, ProcessingProgress: 5, ProcessingQueuedAt: &queuedAt, ProcessingNextAttempt: &queuedAt,
+		OCRText: result.MedicalText, Markers: result.Markers, Report: result.Report, AIReview: result.Review, Status: domain.AnalysisStatusReady,
+		ProcessingStage: domain.ProcessingStageCompleted, ProcessingProgress: 100, ProcessingAttempt: 1,
+		ProcessingStartedAt: &startedAt, ProcessingCompletedAt: &completedAt,
 		SharedWith: []primitive.ObjectID{}, IsDeveloper: patient.IsDeveloper,
 	}
 	if e = a.store.CreateAnalysis(r.Context(), &item); e != nil {
@@ -781,7 +797,7 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 		write(w, 500, map[string]string{"error": "could not save analysis"})
 		return
 	}
-	write(w, http.StatusAccepted, item)
+	write(w, http.StatusCreated, item)
 }
 func parseID(raw string) (primitive.ObjectID, error) { return primitive.ObjectIDFromHex(raw) }
 func canRead(a domain.Analysis, u actor) bool {
@@ -890,16 +906,29 @@ func (a *API) reprocess(w http.ResponseWriter, r *http.Request) {
 		write(w, 404, map[string]string{"error": "original file not found"})
 		return
 	}
-	if item.Status == domain.AnalysisStatusQueued || item.Status == domain.AnalysisStatusProcessing {
-		write(w, http.StatusAccepted, item)
+	patient, patientErr := a.store.UserByID(r.Context(), u.ID)
+	if patientErr != nil {
+		write(w, 404, map[string]string{"error": "patient not found"})
 		return
 	}
-	item, err = a.store.QueueAnalysis(r.Context(), id, u.ID)
+	startedAt := time.Now().UTC()
+	result, err := a.analyzer.AnalyzeDocumentForPatient(r.Context(), item.StoragePath, item.MimeType, patient.PatientProfile)
 	if err != nil {
-		write(w, 500, map[string]string{"error": "could not queue recognition"})
+		writeAIServiceError(w, err, http.StatusBadGateway, "Не удалось достоверно распознать документ. Проверьте оригинал и повторите попытку.")
 		return
 	}
-	write(w, http.StatusAccepted, item)
+	item.Title, item.Category, item.CollectedAt = result.Title, result.Category, result.CollectedAt
+	item.OCRText, item.Markers, item.Report, item.AIReview = result.MedicalText, result.Markers, result.Report, result.Review
+	item.Status, item.ProcessingStage, item.ProcessingProgress = domain.AnalysisStatusReady, domain.ProcessingStageCompleted, 100
+	item.ProcessingAttempt++
+	item.ProcessingStartedAt = &startedAt
+	completedAt := time.Now().UTC()
+	item.ProcessingCompletedAt = &completedAt
+	if err = a.store.ReplaceAnalysisResult(r.Context(), id, u.ID, item); err != nil {
+		write(w, 500, map[string]string{"error": "could not save recognition result"})
+		return
+	}
+	write(w, http.StatusOK, item)
 }
 
 func (a *API) confirmAnalysis(w http.ResponseWriter, r *http.Request) {

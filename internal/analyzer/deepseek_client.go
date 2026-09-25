@@ -20,6 +20,7 @@ const (
 	defaultDeepSeekMaxConcurrent     = 2
 	defaultDeepSeekTimeout           = 45 * time.Second
 	maxDeepSeekRequestBytes          = 256 << 10
+	maxDeepSeekVisionRequestBytes    = 30 << 20
 	maxDeepSeekResponseBytes         = 1 << 20
 )
 
@@ -115,12 +116,20 @@ func parseRetryAfter(value string) time.Duration {
 }
 
 func (s *Service) requestDeepSeek(ctx context.Context, payload any) (string, error) {
+	return s.requestDeepSeekWithLimits(ctx, payload, maxDeepSeekRequestBytes, time.Duration(s.cfg.DeepSeekTimeoutSeconds)*time.Second)
+}
+
+func (s *Service) requestDeepSeekVision(ctx context.Context, payload any) (string, error) {
+	return s.requestDeepSeekWithLimits(ctx, payload, maxDeepSeekVisionRequestBytes, time.Duration(s.cfg.DeepSeekVisionTimeoutSeconds)*time.Second)
+}
+
+func (s *Service) requestDeepSeekWithLimits(ctx context.Context, payload any, maxRequestBytes int, timeout time.Duration) (string, error) {
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", err
 	}
-	if len(body) > maxDeepSeekRequestBytes {
-		return "", fmt.Errorf("deepseek request exceeds %d bytes", maxDeepSeekRequestBytes)
+	if len(body) > maxRequestBytes {
+		return "", fmt.Errorf("deepseek request exceeds %d bytes", maxRequestBytes)
 	}
 
 	release, err := s.aiLimiter.acquire(time.Now().UTC())
@@ -129,7 +138,6 @@ func (s *Service) requestDeepSeek(ctx context.Context, payload any) (string, err
 	}
 	defer release()
 
-	timeout := time.Duration(s.cfg.DeepSeekTimeoutSeconds) * time.Second
 	if timeout <= 0 {
 		timeout = defaultDeepSeekTimeout
 	}

@@ -45,9 +45,16 @@ func New(cfg config.Config) *Service {
 	if cfg.DeepSeekTimeoutSeconds <= 0 {
 		cfg.DeepSeekTimeoutSeconds = int(defaultDeepSeekTimeout / time.Second)
 	}
+	if cfg.DeepSeekVisionTimeoutSeconds <= 0 {
+		cfg.DeepSeekVisionTimeoutSeconds = 120
+	}
+	clientTimeout := cfg.DeepSeekTimeoutSeconds
+	if cfg.DeepSeekVisionTimeoutSeconds > clientTimeout {
+		clientTimeout = cfg.DeepSeekVisionTimeoutSeconds
+	}
 	return &Service{
 		cfg:       cfg,
-		client:    &http.Client{Timeout: time.Duration(cfg.DeepSeekTimeoutSeconds+5) * time.Second},
+		client:    &http.Client{Timeout: time.Duration(clientTimeout+5) * time.Second},
 		ocrSlots:  make(chan struct{}, cfg.OCRWorkerCount),
 		aiLimiter: newDeepSeekLimiter(cfg.DeepSeekRequestsPerMinute, cfg.DeepSeekRequestsPerHour, cfg.DeepSeekMaxConcurrent),
 	}
@@ -1356,7 +1363,7 @@ func (s *Service) deepSeekReview(ctx context.Context, markers []domain.Marker, p
 	var out struct {
 		AIReview domain.AIReview `json:"ai_review"`
 	}
-	system := "Ты медицинский модуль краткого резюме лабораторных результатов. Верни только JSON {ai_review:{summary,lifestyle:[],nutrition:[],doctor_needed,urgency,suggested_specialty}}. Summary: 2–4 понятных предложения только о содержании анализа и отклонениях, без диагноза и назначения препаратов. Учитывай возраст и ИМТ как контекст. Если есть значимые отклонения, укажи подходящую специальность врача. Не повторяй таблицу и не выдумывай данные."
+	system := "Ты медицинский модуль краткого резюме лабораторных результатов. Верни только JSON {ai_review:{summary,lifestyle:[],nutrition:[],doctor_needed,urgency,suggested_specialty}}. Summary: 2–4 понятных предложения только о содержании анализа и отклонениях, без диагноза и назначения препаратов. Называй показатель нормальным или отклонённым исключительно по переданному status; status=unknown означает, что на бланке нет референса, и такой показатель нельзя объявлять нормальным. Не объясняй возможные заболевания или причины отклонений. Учитывай возраст и ИМТ только как явно обозначенный контекст. Если есть значимые отклонения, укажи подходящую специальность врача. urgency — строго routine, soon или urgent. Не повторяй всю таблицу и не выдумывай данные."
 	if err = s.completeJSON(ctx, system, profileContext+"\nПоказатели: "+string(markerJSON), &out); err != nil {
 		return domain.AIReview{}, err
 	}
@@ -1365,6 +1372,11 @@ func (s *Service) deepSeekReview(ctx context.Context, markers []domain.Marker, p
 	}
 	out.AIReview.Provider = "deepseek"
 	out.AIReview.Disclaimer = ruleReview(markers).Disclaimer
+	switch out.AIReview.Urgency {
+	case "routine", "soon", "urgent":
+	default:
+		out.AIReview.Urgency = "routine"
+	}
 	if out.AIReview.Lifestyle == nil {
 		out.AIReview.Lifestyle = []string{}
 	}

@@ -347,6 +347,31 @@ func (s *Mongo) QueueAnalysis(ctx context.Context, id, owner primitive.ObjectID)
 	return item, err
 }
 
+// ReplaceAnalysisResult atomically publishes a result produced by the
+// synchronous document pipeline. Readers never observe a half-populated item.
+func (s *Mongo) ReplaceAnalysisResult(ctx context.Context, id, owner primitive.ObjectID, result domain.Analysis) error {
+	now := time.Now().UTC()
+	set := bson.M{
+		"title": result.Title, "category": result.Category, "ocr_text": result.OCRText,
+		"markers": result.Markers, "report": result.Report, "ai_review": result.AIReview,
+		"status": domain.AnalysisStatusReady, "processing_stage": domain.ProcessingStageCompleted,
+		"processing_progress": 100, "processing_attempt": result.ProcessingAttempt,
+		"processing_error": "", "processing_started_at": result.ProcessingStartedAt,
+		"processing_completed_at": now, "updated_at": now,
+	}
+	if result.CollectedAt != nil {
+		set["collected_at"] = result.CollectedAt
+	}
+	r, err := s.db.Collection("analyses").UpdateOne(ctx,
+		bson.M{"_id": id, "owner_id": owner},
+		bson.M{"$set": set, "$unset": bson.M{"processing_worker": "", "processing_lease_until": "", "processing_next_attempt_at": ""}},
+	)
+	if err == nil && r.MatchedCount == 0 {
+		return mongo.ErrNoDocuments
+	}
+	return err
+}
+
 func (s *Mongo) RecordUsageEvent(ctx context.Context, kind string, user domain.User) error {
 	if user.Role != domain.RolePatient || user.IsDeveloper {
 		return nil

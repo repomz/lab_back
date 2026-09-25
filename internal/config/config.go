@@ -7,16 +7,16 @@ import (
 )
 
 type Config struct {
-	HTTPAddr, MongoURI, MongoDatabase, JWTSecret, UploadDir, PublicBaseURL string
-	DeepSeekAPIKey, DeepSeekBaseURL, DeepSeekModel, OCRMode, TesseractLang string
-	AdminLogin, AdminPIN                                                   string
-	CORSOrigins                                                            []string
-	MaxUploadMB                                                            int64
-	DeepSeekRequestsPerMinute, DeepSeekRequestsPerHour                     int
-	DeepSeekMaxConcurrent, DeepSeekTimeoutSeconds                          int
-	AIUserRequestsPerMinute, AIUserRequestsPerHour                         int
-	OCRWorkerCount, OCRJobMaxAttempts                                      int
-	OCRJobTimeoutSeconds, OCRJobLeaseSeconds                               int
+	HTTPAddr, MongoURI, MongoDatabase, JWTSecret, UploadDir, PublicBaseURL                      string
+	DeepSeekAPIKey, DeepSeekBaseURL, DeepSeekModel, DeepSeekVisionModel, OCRMode, TesseractLang string
+	AdminLogin, AdminPIN                                                                        string
+	CORSOrigins                                                                                 []string
+	MaxUploadMB                                                                                 int64
+	DeepSeekRequestsPerMinute, DeepSeekRequestsPerHour                                          int
+	DeepSeekMaxConcurrent, DeepSeekTimeoutSeconds, DeepSeekVisionTimeoutSeconds                 int
+	AIUserRequestsPerMinute, AIUserRequestsPerHour                                              int
+	OCRWorkerCount, OCRJobMaxAttempts                                                           int
+	OCRJobTimeoutSeconds, OCRJobLeaseSeconds                                                    int
 }
 
 func Load() Config {
@@ -25,20 +25,21 @@ func Load() Config {
 		MongoDatabase: env("MONGO_DATABASE", "lab"), JWTSecret: env("JWT_SECRET", "development-secret-change-me-please"),
 		UploadDir: env("UPLOAD_DIR", "./data/uploads"), PublicBaseURL: env("PUBLIC_BASE_URL", "http://localhost:8080"),
 		DeepSeekAPIKey: os.Getenv("DEEPSEEK_API_KEY"), DeepSeekBaseURL: env("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-		DeepSeekModel: env("DEEPSEEK_MODEL", "deepseek-v4-flash"), OCRMode: env("OCR_MODE", "local"),
+		DeepSeekModel: env("DEEPSEEK_MODEL", "deepseek-v4-flash"), DeepSeekVisionModel: env("DEEPSEEK_VISION_MODEL", "deepseek-flash"), OCRMode: env("OCR_MODE", "local"),
 		TesseractLang: env("TESSERACT_LANG", "rus+eng"), CORSOrigins: strings.Split(env("CORS_ORIGINS", "http://localhost:8081"), ","),
 		AdminLogin: strings.ToLower(strings.TrimSpace(os.Getenv("ADMIN_LOGIN"))), AdminPIN: strings.TrimSpace(os.Getenv("ADMIN_PIN")),
-		MaxUploadMB:               envInt("MAX_UPLOAD_MB", 20),
-		DeepSeekRequestsPerMinute: int(envInt("DEEPSEEK_REQUESTS_PER_MINUTE", 30)),
-		DeepSeekRequestsPerHour:   int(envInt("DEEPSEEK_REQUESTS_PER_HOUR", 300)),
-		DeepSeekMaxConcurrent:     int(envInt("DEEPSEEK_MAX_CONCURRENT", 2)),
-		DeepSeekTimeoutSeconds:    int(envInt("DEEPSEEK_TIMEOUT_SECONDS", 45)),
-		AIUserRequestsPerMinute:   int(envInt("AI_USER_REQUESTS_PER_MINUTE", 6)),
-		AIUserRequestsPerHour:     int(envInt("AI_USER_REQUESTS_PER_HOUR", 60)),
-		OCRWorkerCount:            int(envInt("OCR_WORKER_COUNT", 1)),
-		OCRJobMaxAttempts:         int(envInt("OCR_JOB_MAX_ATTEMPTS", 3)),
-		OCRJobTimeoutSeconds:      int(envInt("OCR_JOB_TIMEOUT_SECONDS", 180)),
-		OCRJobLeaseSeconds:        int(envInt("OCR_JOB_LEASE_SECONDS", 240)),
+		MaxUploadMB:                  envInt("MAX_UPLOAD_MB", 20),
+		DeepSeekRequestsPerMinute:    int(envInt("DEEPSEEK_REQUESTS_PER_MINUTE", 30)),
+		DeepSeekRequestsPerHour:      int(envInt("DEEPSEEK_REQUESTS_PER_HOUR", 300)),
+		DeepSeekMaxConcurrent:        int(envInt("DEEPSEEK_MAX_CONCURRENT", 2)),
+		DeepSeekTimeoutSeconds:       int(envInt("DEEPSEEK_TIMEOUT_SECONDS", 45)),
+		DeepSeekVisionTimeoutSeconds: int(envInt("DEEPSEEK_VISION_TIMEOUT_SECONDS", 120)),
+		AIUserRequestsPerMinute:      int(envInt("AI_USER_REQUESTS_PER_MINUTE", 6)),
+		AIUserRequestsPerHour:        int(envInt("AI_USER_REQUESTS_PER_HOUR", 60)),
+		OCRWorkerCount:               int(envInt("OCR_WORKER_COUNT", 1)),
+		OCRJobMaxAttempts:            int(envInt("OCR_JOB_MAX_ATTEMPTS", 3)),
+		OCRJobTimeoutSeconds:         int(envInt("OCR_JOB_TIMEOUT_SECONDS", 180)),
+		OCRJobLeaseSeconds:           int(envInt("OCR_JOB_LEASE_SECONDS", 240)),
 	}
 }
 
