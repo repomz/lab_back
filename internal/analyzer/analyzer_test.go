@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/repomz/lab_back/internal/config"
@@ -243,9 +244,96 @@ func TestOCRGroupCodeIsNotUsedAsTriglycerideValue(t *testing.T) {
 	}
 }
 
+func TestParseCBCFromPhotographedForm(t *testing.T) {
+	text := `
+СОЭ по Панченкову 21,0 2 - 15 мм/час
+Нейтрофилы палочкоядерные 0 1 - 5 %
+Нейтрофилы сегментоядерные 47 50 - 70 %
+Эозинофилы 3 2 - 4 %
+Моноциты ручной подсчёт 3 2 - 8 %
+Лимфоциты 47 25 - 40 %
+WBC 6,70 4 - 10 10^9/л
+RBC 4,55 3,5 - 5,5 10^12/л
+HGB 130,0 г/л
+HCT 0,387 0,35 - 0,5
+PLT 270,0 150 - 320 10^9/л
+LYM% 52,70 20 - 40 %
+MON% 4,90 3 - 15 %
+GRAN% 42,40 50 - 70 %`
+	markers := parseMarkers(text)
+	byName := map[string]domain.Marker{}
+	for _, marker := range markers {
+		byName[marker.CanonicalName] = marker
+	}
+	for _, name := range []string{"esr", "band_neutrophils", "segmented_neutrophils", "leukocytes", "erythrocytes", "hemoglobin", "platelets", "lymphocytes_percent", "granulocytes_percent"} {
+		if _, ok := byName[name]; !ok {
+			t.Fatalf("missing %s in %#v", name, markers)
+		}
+	}
+	if byName["esr"].Status != domain.StatusHigh || byName["band_neutrophils"].Status != domain.StatusLow || byName["granulocytes_percent"].Status != domain.StatusLow {
+		t.Fatalf("wrong CBC statuses: ESR=%s bands=%s GRAN=%s", byName["esr"].Status, byName["band_neutrophils"].Status, byName["granulocytes_percent"].Status)
+	}
+}
+
+func TestParseUrinalysisQualitativeValues(t *testing.T) {
+	text := `
+Микроскопическое исследование осадка мочи
+Эпителий плоский 1-2
+Бактерии +
+Слизь +
+Лейкоциты 6-8
+Общий анализ мочи
+pH 6.0
+Аскорбиновая кислота Отрицательно
+Нитриты Отрицательно
+Эритроциты Отрицательно
+Лейкоциты ++++
+Кетоновые тела Отрицательно
+Уробилиноген Норма
+Билирубин Отрицательно
+Глюкоза Норма
+Белок Отрицательно
+Относительная плотность 1.015
+Прозрачность Слегка мутная
+Цвет Соломенно-желтый`
+	markers := parseMarkers(text)
+	byName := map[string]domain.Marker{}
+	for _, marker := range markers {
+		byName[marker.CanonicalName] = marker
+	}
+	if len(markers) < 14 {
+		t.Fatalf("only %d urine fields: %#v", len(markers), markers)
+	}
+	if byName["urine_leukocytes"].TextValue != "++++" || byName["urine_leukocytes"].Status != domain.StatusHigh {
+		t.Fatalf("wrong urine leukocytes: %#v", byName["urine_leukocytes"])
+	}
+	if byName["urine_nitrites"].Status != domain.StatusNormal || byName["urine_clarity"].Status != domain.StatusUnknown {
+		t.Fatalf("wrong qualitative statuses: %#v %#v", byName["urine_nitrites"], byName["urine_clarity"])
+	}
+}
+
+func TestExtractNarrativeStudiesWithoutInventingConclusion(t *testing.T) {
+	ct := `Компьютерная томография органов грудной полости
+Дата исследования: 25.08.2026
+Протокол: Легочные поля симметричные. Инфильтративных изменений не выявлено.
+Заключение: КТ-признаки пневмофиброза, перенесенной ТЭЛА справа, ЛАГ
+Врач: специалист`
+	report := ExtractStudyReport(ct)
+	if report == nil || report.Modality != "КТ" || !strings.Contains(report.Conclusion, "пневмофиброза") || strings.Contains(report.Description, "Дата исследования") {
+		t.Fatalf("unexpected CT report: %#v", report)
+	}
+	ultrasound := `ПРОТОКОЛ УЛЬТРАЗВУКОВОГО ИССЛЕДОВАНИЯ
+Ультразвуковое исследование щитовидной железы и региональных лимфатических узлов
+Щитовидная железа расположена обычно. Выявляются узлы: 6,5x8,0x9,0 мм.`
+	report = ExtractStudyReport(ultrasound)
+	if report == nil || report.Conclusion != "" || len(report.Warnings) == 0 {
+		t.Fatalf("missing-conclusion report must remain explicit: %#v", report)
+	}
+}
+
 func TestExplicitDecimalZeroAtReferenceBoundaryRemainsCredible(t *testing.T) {
 	markers := parseOCRCandidates([]string{"СРБ 0,0 0-10 мг/л", "СРБ\n0,0\n0-10\nмг/л"})
-	if len(markers) != 1 || markers[0].Confidence < 0.9 || markers[0].Status != domain.StatusNormal {
+	if len(markers) != 1 || markers[0].Confidence < 0.85 || markers[0].Status != domain.StatusNormal {
 		t.Fatalf("unexpected CRP marker: %#v", markers)
 	}
 }

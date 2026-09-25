@@ -28,7 +28,7 @@ func (f *fakeQueueStore) UpdateOCRJobProgress(_ context.Context, _ primitive.Obj
 	f.progress = append(f.progress, stage)
 	return nil
 }
-func (f *fakeQueueStore) CompleteOCRJob(_ context.Context, job domain.Analysis, _ string, _ string, _ []domain.Marker, _ string, title, category string, _ *time.Time) error {
+func (f *fakeQueueStore) CompleteOCRJob(_ context.Context, job domain.Analysis, _ string, _ string, _ []domain.Marker, _ *domain.StudyReport, _ string, title, category string, _ *time.Time) error {
 	f.completed = true
 	job.Title, job.Category = title, category
 	f.completedWith = job
@@ -45,13 +45,13 @@ func (f *fakeQueueStore) UserByID(context.Context, primitive.ObjectID) (domain.U
 
 type fakeRecognizer struct{ err error }
 
-func (f fakeRecognizer) RecognizeJob(_ context.Context, _ string, _ string, _ *domain.PatientProfile, progress func(string, int)) (string, []domain.Marker, string, error) {
+func (f fakeRecognizer) RecognizeJob(_ context.Context, _ string, _ string, _ *domain.PatientProfile, progress func(string, int)) (string, []domain.Marker, *domain.StudyReport, string, error) {
 	progress(domain.ProcessingStageRecognizing, 35)
 	if f.err != nil {
-		return "", nil, domain.AnalysisStatusFailed, f.err
+		return "", nil, nil, domain.AnalysisStatusFailed, f.err
 	}
 	value := 4.7
-	return "Глюкоза 4,7 ммоль/л 3,9-6,4", []domain.Marker{{Name: "Глюкоза", CanonicalName: "glucose", Value: &value, Status: domain.StatusNormal}}, domain.AnalysisStatusAwaitingConfirmation, nil
+	return "Глюкоза 4,7 ммоль/л 3,9-6,4", []domain.Marker{{Name: "Глюкоза", CanonicalName: "glucose", Value: &value, Status: domain.StatusNormal}}, nil, domain.AnalysisStatusAwaitingConfirmation, nil
 }
 
 func TestOCRQueueCompletesRecognizedJob(t *testing.T) {

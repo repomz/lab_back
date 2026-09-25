@@ -20,14 +20,14 @@ type queueStore interface {
 	RecoverExpiredOCRJobs(context.Context, int) error
 	ClaimOCRJob(context.Context, string, time.Duration, int) (domain.Analysis, error)
 	UpdateOCRJobProgress(context.Context, primitive.ObjectID, string, string, int, time.Duration) error
-	CompleteOCRJob(context.Context, domain.Analysis, string, string, []domain.Marker, string, string, string, *time.Time) error
+	CompleteOCRJob(context.Context, domain.Analysis, string, string, []domain.Marker, *domain.StudyReport, string, string, string, *time.Time) error
 	RetryOCRJob(context.Context, primitive.ObjectID, string, time.Time, string, bool) error
 	ReleaseOCRJob(context.Context, primitive.ObjectID, string) error
 	UserByID(context.Context, primitive.ObjectID) (domain.User, error)
 }
 
 type recognizer interface {
-	RecognizeJob(context.Context, string, string, *domain.PatientProfile, func(string, int)) (string, []domain.Marker, string, error)
+	RecognizeJob(context.Context, string, string, *domain.PatientProfile, func(string, int)) (string, []domain.Marker, *domain.StudyReport, string, error)
 }
 
 type OCRQueue struct {
@@ -146,13 +146,13 @@ func (q *OCRQueue) processJob(parent context.Context, worker string, job domain.
 			log.Printf("ocr progress update failed analysis=%s: %v", job.ID.Hex(), err)
 		}
 	}
-	text, markers, status, err := q.recognizer.RecognizeJob(jobCtx, job.StoragePath, job.MimeType, patient.PatientProfile, progress)
+	text, markers, report, status, err := q.recognizer.RecognizeJob(jobCtx, job.StoragePath, job.MimeType, patient.PatientProfile, progress)
 	if err != nil {
 		q.handleFailure(parent, worker, job, err)
 		return
 	}
 	category := analyzer.ClassifyAnalysis(markers, text)
-	if err = q.store.CompleteOCRJob(jobCtx, job, worker, text, markers, status, category, category, analyzer.ExtractCollectedAt(text)); err != nil {
+	if err = q.store.CompleteOCRJob(jobCtx, job, worker, text, markers, report, status, category, category, analyzer.ExtractCollectedAt(text)); err != nil {
 		if !errors.Is(err, mongo.ErrNoDocuments) {
 			log.Printf("ocr completion failed analysis=%s: %v", job.ID.Hex(), err)
 		}

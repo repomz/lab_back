@@ -59,7 +59,11 @@ func buildAnalysisPDF(item domain.Analysis) ([]byte, error) {
 	pdf.SetTextColor(255, 255, 255)
 	pdf.SetFont("Lab", "B", 19)
 	pdf.SetXY(16, 10)
-	pdf.CellFormat(178, 8, "Результаты лабораторного анализа", "", 1, "L", false, 0, "")
+	headerTitle := "Результаты лабораторного анализа"
+	if item.Report != nil {
+		headerTitle = "Результат медицинского исследования"
+	}
+	pdf.CellFormat(178, 8, headerTitle, "", 1, "L", false, 0, "")
 	pdf.SetFont("Lab", "", 10)
 	pdf.SetX(16)
 	pdf.CellFormat(178, 6, "Сформировано приложением Lab", "", 1, "L", false, 0, "")
@@ -77,49 +81,66 @@ func buildAnalysisPDF(item domain.Analysis) ([]byte, error) {
 	pdf.CellFormat(178, 6, "Дата исследования: "+studyDate, "", 1, "L", false, 0, "")
 	pdf.Ln(4)
 
-	widths := []float64{66, 35, 45, 32}
-	headers := []string{"Показатель", "Результат", "Референс", "Статус"}
-	pdf.SetFillColor(235, 241, 249)
-	pdf.SetDrawColor(210, 218, 230)
-	pdf.SetTextColor(28, 35, 48)
-	pdf.SetFont("Lab", "B", 9)
-	for i, header := range headers {
-		pdf.CellFormat(widths[i], 9, header, "1", 0, "L", true, 0, "")
-	}
-	pdf.Ln(-1)
-	pdf.SetFont("Lab", "", 9)
-	for _, marker := range item.Markers {
-		if pdf.GetY() > 267 {
-			pdf.AddPage()
+	if item.Report != nil {
+		pdf.SetTextColor(28, 35, 48)
+		pdf.SetFont("Lab", "B", 11)
+		pdf.CellFormat(178, 7, "Описание", "", 1, "L", false, 0, "")
+		pdf.SetFont("Lab", "", 9)
+		pdf.MultiCell(178, 5, item.Report.Description, "", "L", false)
+		pdf.Ln(4)
+		pdf.SetFont("Lab", "B", 11)
+		pdf.CellFormat(178, 7, "Заключение", "", 1, "L", false, 0, "")
+		pdf.SetFont("Lab", "", 9)
+		conclusion := item.Report.Conclusion
+		if strings.TrimSpace(conclusion) == "" {
+			conclusion = "Заключение отсутствует в предоставленном фрагменте."
 		}
-		value := marker.TextValue
-		if marker.Value != nil {
-			value = strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.3f", *marker.Value), "0"), ".")
-		}
-		if marker.Unit != "" {
-			value += " " + marker.Unit
-		}
-		reference := marker.ReferenceText
-		if reference == "" {
-			switch {
-			case marker.ReferenceMin != nil && marker.ReferenceMax != nil:
-				reference = fmt.Sprintf("%g — %g", *marker.ReferenceMin, *marker.ReferenceMax)
-			case marker.ReferenceMin != nil:
-				reference = fmt.Sprintf("от %g", *marker.ReferenceMin)
-			case marker.ReferenceMax != nil:
-				reference = fmt.Sprintf("до %g", *marker.ReferenceMax)
-			default:
-				reference = "Не указан"
-			}
-		}
-		cells := []string{shortPDFText(marker.Name, 42), shortPDFText(value, 24), shortPDFText(reference, 28), markerStatusLabel(marker.Status)}
-		for i, cell := range cells {
-			pdf.CellFormat(widths[i], 9, cell, "1", 0, "L", false, 0, "")
+		pdf.MultiCell(178, 5, conclusion, "", "L", false)
+	} else {
+		widths := []float64{66, 35, 45, 32}
+		headers := []string{"Показатель", "Результат", "Референс", "Статус"}
+		pdf.SetFillColor(235, 241, 249)
+		pdf.SetDrawColor(210, 218, 230)
+		pdf.SetTextColor(28, 35, 48)
+		pdf.SetFont("Lab", "B", 9)
+		for i, header := range headers {
+			pdf.CellFormat(widths[i], 9, header, "1", 0, "L", true, 0, "")
 		}
 		pdf.Ln(-1)
-	}
-	if len(item.Markers) == 0 {
-		pdf.CellFormat(178, 12, "Показатели не распознаны", "1", 1, "C", false, 0, "")
+		pdf.SetFont("Lab", "", 9)
+		for _, marker := range item.Markers {
+			if pdf.GetY() > 267 {
+				pdf.AddPage()
+			}
+			value := marker.TextValue
+			if marker.Value != nil {
+				value = strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.3f", *marker.Value), "0"), ".")
+			}
+			if marker.Unit != "" {
+				value += " " + marker.Unit
+			}
+			reference := marker.ReferenceText
+			if reference == "" {
+				switch {
+				case marker.ReferenceMin != nil && marker.ReferenceMax != nil:
+					reference = fmt.Sprintf("%g — %g", *marker.ReferenceMin, *marker.ReferenceMax)
+				case marker.ReferenceMin != nil:
+					reference = fmt.Sprintf("от %g", *marker.ReferenceMin)
+				case marker.ReferenceMax != nil:
+					reference = fmt.Sprintf("до %g", *marker.ReferenceMax)
+				default:
+					reference = "Не указан"
+				}
+			}
+			cells := []string{shortPDFText(marker.Name, 42), shortPDFText(value, 24), shortPDFText(reference, 28), markerStatusLabel(marker.Status)}
+			for i, cell := range cells {
+				pdf.CellFormat(widths[i], 9, cell, "1", 0, "L", false, 0, "")
+			}
+			pdf.Ln(-1)
+		}
+		if len(item.Markers) == 0 {
+			pdf.CellFormat(178, 12, "Показатели не распознаны", "1", 1, "C", false, 0, "")
+		}
 	}
 	pdf.Ln(7)
 	pdf.SetFont("Lab", "", 8)

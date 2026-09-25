@@ -72,7 +72,7 @@ func (s *Service) ProcessForPatient(ctx context.Context, path, mime string, prof
 // RecognizeForPatient extracts a verifiable table but deliberately postpones
 // interpretation until the patient confirms the values.
 func (s *Service) RecognizeForPatient(ctx context.Context, path, mime string, profile *domain.PatientProfile) (string, []domain.Marker, string) {
-	text, markers, status, _ := s.RecognizeJob(ctx, path, mime, profile, nil)
+	text, markers, _, status, _ := s.RecognizeJob(ctx, path, mime, profile, nil)
 	return text, markers, status
 }
 
@@ -80,7 +80,7 @@ type RecognitionProgress = func(stage string, progress int)
 
 // RecognizeJob is the durable-worker entry point. Unlike the compatibility
 // wrapper above it returns transient failures so the queue can retry them.
-func (s *Service) RecognizeJob(ctx context.Context, path, mime string, profile *domain.PatientProfile, progress RecognitionProgress) (string, []domain.Marker, string, error) {
+func (s *Service) RecognizeJob(ctx context.Context, path, mime string, profile *domain.PatientProfile, progress RecognitionProgress) (string, []domain.Marker, *domain.StudyReport, string, error) {
 	started := time.Now()
 	report := func(stage string, value int) {
 		if progress != nil {
@@ -90,7 +90,7 @@ func (s *Service) RecognizeJob(ctx context.Context, path, mime string, profile *
 	select {
 	case s.ocrSlots <- struct{}{}:
 	case <-ctx.Done():
-		return "", []domain.Marker{}, domain.AnalysisStatusFailed, ctx.Err()
+		return "", []domain.Marker{}, nil, domain.AnalysisStatusFailed, ctx.Err()
 	}
 	defer func() { <-s.ocrSlots }()
 	report(domain.ProcessingStagePreprocessing, 15)
@@ -98,33 +98,22 @@ func (s *Service) RecognizeJob(ctx context.Context, path, mime string, profile *
 	text, candidates, err := s.extract(ctx, path, mime)
 	if err != nil {
 		log.Printf("recognition failed file=%s stage=ocr elapsed=%s error=%v", filepath.Base(path), time.Since(started).Round(time.Millisecond), err)
-		return "", []domain.Marker{}, domain.AnalysisStatusFailed, err
+		return "", []domain.Marker{}, nil, domain.AnalysisStatusFailed, err
 	}
 	ocrFinished := time.Now()
 	report(domain.ProcessingStageStructuring, 76)
 	markers := parseOCRCandidates(candidates)
-	if s.cfg.DeepSeekAPIKey != "" && strings.TrimSpace(text) != "" {
-		aiCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		if markersNeedStructuring(markers) {
-			report(domain.ProcessingStageStructuring, 84)
-			m, _, e := s.deepSeek(aiCtx, text, profile)
-			if e != nil {
-				log.Printf("deepseek structuring failed: %v", e)
-			} else if len(m) > 0 {
-				markers = mergeMarkerSets(markers, normalizeExternalMarkers(m))
-			} else {
-				log.Printf("deepseek structuring returned no markers")
-			}
-		}
-		cancel()
-	}
+	reportData := ExtractStudyReport(text)
+	// Raw OCR can contain names, policy numbers and other identifiers. It is
+	// deliberately never sent to an external language model. DeepSeek receives
+	// only the compact marker set after the patient has verified it.
 	report(domain.ProcessingStageFinalizing, 94)
 	status := domain.AnalysisStatusAwaitingConfirmation
-	if len(markers) == 0 {
+	if len(markers) == 0 && reportData == nil {
 		status = domain.AnalysisStatusNeedsReview
 	}
-	log.Printf("recognition complete file=%s ocr=%s total=%s markers=%d status=%s", filepath.Base(path), ocrFinished.Sub(started).Round(time.Millisecond), time.Since(started).Round(time.Millisecond), len(markers), status)
-	return text, markers, status, nil
+	log.Printf("recognition complete file=%s ocr=%s total=%s markers=%d report=%t status=%s", filepath.Base(path), ocrFinished.Sub(started).Round(time.Millisecond), time.Since(started).Round(time.Millisecond), len(markers), reportData != nil, status)
+	return text, markers, reportData, status, nil
 }
 
 func (s *Service) ReviewMarkersForPatient(ctx context.Context, markers []domain.Marker, profile *domain.PatientProfile) domain.AIReview {
@@ -173,6 +162,21 @@ func ClassifyAnalysis(markers []domain.Marker, text string) string {
 		}
 		return false
 	}
+	if hasAny("компьютерная томография", "кт органов", "кт-признак") {
+		if hasAny("грудной полост", "грудной клет", "легк") {
+			return "КТ · органы грудной клетки"
+		}
+		return "Компьютерная томография"
+	}
+	if hasAny("ультразвуковое исследование", "протокол ультразвукового", "эхоскопически") {
+		if hasAny("щитовидн") {
+			return "УЗИ · щитовидная железа"
+		}
+		if hasAny("почки", "почек", "почечн") {
+			return "УЗИ · почки"
+		}
+		return "Ультразвуковое исследование"
+	}
 	cbcMarkers, hormoneMarkers, urineMarkers := 0, 0, 0
 	for _, marker := range markers {
 		switch strings.ToLower(marker.CanonicalName) {
@@ -184,7 +188,7 @@ func ClassifyAnalysis(markers []domain.Marker, text string) string {
 			urineMarkers++
 		}
 	}
-	if urineMarkers >= 2 || hasAny("общий анализ моч", "удельный вес", "плоский эпител", "лейкоциты в моч", "цвет моч") {
+	if urineMarkers >= 2 || hasAny("общий анализ моч", "удельный вес", "плоский эпител", "лейкоциты в моч", "цвет моч", "микроальбумин") {
 		if hasAny("микроальбумин", "суточная моч", "белок в моч", "креатинин моч") {
 			return "Моча · биохимия"
 		}
@@ -207,6 +211,140 @@ func ClassifyAnalysis(markers []domain.Marker, text string) string {
 		return "Кровь · биохимия"
 	}
 	return "Лабораторное исследование"
+}
+
+// ExtractStudyReport handles narrative diagnostic reports without asking a
+// language model to reconstruct medical facts. It copies only text present in
+// the document and leaves a visible warning when the photographed fragment has
+// no formal conclusion.
+func ExtractStudyReport(text string) *domain.StudyReport {
+	clean := strings.ReplaceAll(text, "\r", "")
+	lower := strings.ToLower(strings.ReplaceAll(clean, "ё", "е"))
+	report := &domain.StudyReport{Warnings: []string{}}
+	switch {
+	case strings.Contains(lower, "компьютерн") && (strings.Contains(lower, "томограф") || strings.Contains(lower, "кт-признак")):
+		report.Modality = "КТ"
+		report.StudyName = "Компьютерная томография"
+		if strings.Contains(lower, "грудн") || strings.Contains(lower, "легк") {
+			report.StudyName = "Компьютерная томография органов грудной клетки"
+		}
+	case strings.Contains(lower, "ультразвук") || strings.Contains(lower, "эхоскопически"):
+		report.Modality = "УЗИ"
+		report.StudyName = "Ультразвуковое исследование"
+		if strings.Contains(lower, "щитовидн") {
+			report.StudyName = "Ультразвуковое исследование щитовидной железы"
+		} else if strings.Contains(lower, "почки") || strings.Contains(lower, "почек") {
+			report.StudyName = "Ультразвуковое исследование почек"
+		}
+	default:
+		return nil
+	}
+
+	conclusionStart := findHeading(lower, "заключение")
+	if conclusionStart >= 0 {
+		after := clean[conclusionStart:]
+		if colon := strings.IndexAny(after, ":\n"); colon >= 0 {
+			after = after[colon+1:]
+		}
+		report.Conclusion = trimReportSection(after, []string{"врач:", "врач ", "сформировал", "данное заключение", "результат подтвердил"})
+	}
+
+	start := reportDescriptionStart(lower, report.Modality)
+	end := len(clean)
+	if conclusionStart >= 0 && conclusionStart > start {
+		end = conclusionStart
+	}
+	if start >= 0 && start < end {
+		report.Description = trimReportSection(clean[start:end], []string{"врач:", "врач ", "результат подтвердил"})
+	}
+	if len([]rune(report.Description)) < 40 {
+		report.Description = ""
+		report.Warnings = append(report.Warnings, "Описание исследования распознано не полностью — сверьте с оригиналом.")
+	}
+	if report.Conclusion == "" {
+		report.Warnings = append(report.Warnings, "Заключение отсутствует в предоставленном фрагменте или не распознано.")
+	}
+	report.Confidence = 0.72
+	if report.Description != "" {
+		report.Confidence += 0.1
+	}
+	if report.Conclusion != "" {
+		report.Confidence += 0.1
+	}
+	return report
+}
+
+func findHeading(lower, heading string) int {
+	re := regexp.MustCompile(`(?m)(?:^|\n)\s*` + regexp.QuoteMeta(heading) + `\s*:?`)
+	match := re.FindStringIndex(lower)
+	if match == nil {
+		return -1
+	}
+	return match[0]
+}
+
+func reportDescriptionStart(lower, modality string) int {
+	patterns := []string{"протокол:", "протокол ", "щитовидная железа расположена", "почки\n", "почки \n"}
+	if modality == "КТ" {
+		patterns = []string{"протокол:", "протокол "}
+	}
+	best := -1
+	for _, pattern := range patterns {
+		if index := strings.Index(lower, pattern); index >= 0 && (best < 0 || index < best) {
+			best = index
+		}
+	}
+	return best
+}
+
+func trimReportSection(value string, stops []string) string {
+	lower := strings.ToLower(strings.ReplaceAll(value, "ё", "е"))
+	end := len(value)
+	for _, stop := range stops {
+		if index := strings.Index(lower, stop); index >= 0 && index < end {
+			end = index
+		}
+	}
+	lines := strings.Split(value[:end], "\n")
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.Join(strings.Fields(line), " ")
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+func NormalizeConfirmedReport(report *domain.StudyReport) (*domain.StudyReport, error) {
+	if report == nil {
+		return nil, fmt.Errorf("missing report")
+	}
+	normalized := *report
+	normalized.Modality = strings.TrimSpace(normalized.Modality)
+	normalized.StudyName = strings.TrimSpace(normalized.StudyName)
+	normalized.Description = strings.TrimSpace(normalized.Description)
+	normalized.Conclusion = strings.TrimSpace(normalized.Conclusion)
+	if normalized.StudyName == "" || len([]rune(normalized.StudyName)) > 240 || len([]rune(normalized.Description)) > 20000 || len([]rune(normalized.Conclusion)) > 4000 {
+		return nil, fmt.Errorf("invalid report")
+	}
+	if normalized.Description == "" && normalized.Conclusion == "" {
+		return nil, fmt.Errorf("empty report")
+	}
+	normalized.Confidence = 1
+	normalized.Warnings = nil
+	return &normalized, nil
+}
+
+func (s *Service) ReviewStudyReportForPatient(ctx context.Context, report *domain.StudyReport, profile *domain.PatientProfile) domain.AIReview {
+	summary := "Описание исследования сохранено. Формальное заключение в предоставленном фрагменте отсутствует; сверьте документ с оригиналом и обсудите его с лечащим врачом."
+	if strings.TrimSpace(report.Conclusion) != "" {
+		summary = "В заключении исследования указано: " + strings.TrimSpace(report.Conclusion)
+	}
+	return domain.AIReview{
+		Summary: summary, Lifestyle: []string{}, Nutrition: []string{}, DoctorNeeded: true, Urgency: "routine",
+		Disclaimer: "Это пересказ подтверждённого текста исследования, а не диагноз. Интерпретировать результат должен лечащий врач с учётом симптомов и анамнеза.", Provider: "rules",
+	}
 }
 
 // ExtractCollectedAt prefers specimen collection / study dates and ignores
@@ -245,6 +383,10 @@ func NormalizeConfirmedMarkers(markers []domain.Marker) ([]domain.Marker, error)
 		if marker.Value != nil && (math.IsNaN(*marker.Value) || math.IsInf(*marker.Value, 0)) {
 			return nil, fmt.Errorf("invalid marker value")
 		}
+		marker.TextValue = strings.TrimSpace(marker.TextValue)
+		if len([]rune(marker.TextValue)) > 300 {
+			return nil, fmt.Errorf("invalid marker text value")
+		}
 		marker.Confidence = 1
 		marker.Warnings = nil
 		marker.Status = inferStatus(marker)
@@ -255,6 +397,13 @@ func NormalizeConfirmedMarkers(markers []domain.Marker) ([]domain.Marker, error)
 
 func inferStatus(marker domain.Marker) domain.MarkerStatus {
 	if marker.Value == nil {
+		value := strings.ToLower(strings.ReplaceAll(marker.TextValue, "ё", "е"))
+		if strings.Contains(value, "+") {
+			return domain.StatusHigh
+		}
+		if strings.Contains(value, "отриц") || strings.Contains(value, "норма") {
+			return domain.StatusNormal
+		}
 		return domain.StatusUnknown
 	}
 	if marker.ReferenceMin != nil && *marker.Value < *marker.ReferenceMin {
@@ -357,11 +506,18 @@ func (s *Service) extractImageDetailed(ctx context.Context, path string) (string
 	// The sparse pass costs about as much as the primary OCR pass. It is useful
 	// when table mode loses whole rows, but not when a mostly complete table only
 	// has an uncertain reference: DeepSeek structuring handles that later.
-	primaryIncomplete := len(primaryMarkers) < 8
+	primaryReport := ExtractStudyReport(primary)
+	primaryIncomplete := len(primaryMarkers) < 8 && (primaryReport == nil || len(strings.Fields(primaryReport.Description)) < 30)
 	if primaryErr != nil || primaryIncomplete {
-		fallback, fallbackErr := runPass("11", s.cfg.TesseractLang)
+		fallback, fallbackErr := runPass("6", s.cfg.TesseractLang)
 		if strings.TrimSpace(fallback) != "" {
 			candidates = append(candidates, fallback)
+		}
+		if fallbackErr == nil && ExtractStudyReport(fallback) == nil {
+			sparse, _ := runPass("11", s.cfg.TesseractLang)
+			if strings.TrimSpace(sparse) != "" {
+				candidates = append(candidates, sparse)
+			}
 		}
 		if len(candidates) == 0 {
 			if fallbackErr != nil {
@@ -420,12 +576,16 @@ func ocrScore(text string) int {
 	decimalValues := len(regexp.MustCompile(`\d+[.,]\d+`).FindAllString(text, -1))
 	lower := strings.ToLower(text)
 	labTerms := 0
-	for _, term := range []string{"глюкоз", "альбумин", "билирубин", "креатинин", "мочевин", "холестерин"} {
+	for _, term := range []string{"глюкоз", "альбумин", "билирубин", "креатинин", "мочевин", "холестерин", "лейкоцит", "эритроцит", "гемоглобин", "тромбоцит", "анализ моч", "заключение", "ультразвук", "томограф"} {
 		if strings.Contains(lower, term) {
 			labTerms++
 		}
 	}
-	return len(parseMarkers(text))*10000 + decimalValues*200 + labTerms*100 + len(strings.Fields(text))
+	reportScore := 0
+	if report := ExtractStudyReport(text); report != nil {
+		reportScore = len(strings.Fields(report.Description))*80 + len(strings.Fields(report.Conclusion))*500
+	}
+	return len(parseMarkers(text))*10000 + decimalValues*200 + labTerms*100 + reportScore + len(strings.Fields(text))
 }
 
 type markerSpec struct {
@@ -448,12 +608,29 @@ var markerSpecs = []markerSpec{
 	{"Мочевина", "urea", "ммоль/л", []string{"мочевин"}, 100},
 	{"Креатинин", "creatinine", "мкмоль/л", []string{"креатинин"}, 2000},
 	{"СКФ", "egfr", "мл/мин/1,73 м²", []string{"фильтрац"}, 200},
-	{"СРБ", "crp", "мг/л", []string{"срб", "cpb"}, 1000},
+	{"СРБ", "crp", "мг/л", []string{"срб"}, 1000},
 	{"Мочевая кислота", "uric_acid", "мкмоль/л", []string{"мочевая кислота", "mouebas кислота"}, 2000},
 	{"Железо", "iron", "мкмоль/л", []string{"железо"}, 200},
 	{"Кальций общий", "calcium_total", "ммоль/л", []string{"кальций"}, 10},
 	{"Калий", "potassium", "ммоль/л", []string{"калий"}, 20},
 	{"Натрий", "sodium", "ммоль/л", []string{"натрий"}, 200},
+	{"СОЭ", "esr", "мм/ч", []string{"соэ по панченкову", "соэпо панченкову", "соэ"}, 200},
+	{"Нейтрофилы палочкоядерные", "band_neutrophils", "%", []string{"нейтрофилы палочкоядерные", "палочкоядерные"}, 100},
+	{"Нейтрофилы сегментоядерные", "segmented_neutrophils", "%", []string{"нейтрофилы сегментоядерные", "сегментоядерные"}, 100},
+	{"Эозинофилы", "eosinophils", "%", []string{"эозинофилы"}, 100},
+	{"Моноциты", "monocytes", "%", []string{"моноциты ручной подсчет", "моноциты"}, 100},
+	{"Лимфоциты", "lymphocytes", "%", []string{"лимфоциты"}, 100},
+	{"Лейкоциты (WBC)", "leukocytes", "10^9/л", []string{"wbc"}, 1000},
+	{"Эритроциты (RBC)", "erythrocytes", "10^12/л", []string{"rbc"}, 100},
+	{"Гемоглобин (HGB)", "hemoglobin", "г/л", []string{"hgb", "гемоглобин"}, 1000},
+	{"Гематокрит (HCT)", "hematocrit", "л/л", []string{"hct", "гематокрит"}, 10},
+	{"Тромбоциты (PLT)", "platelets", "10^9/л", []string{"plt", "тромбоциты"}, 5000},
+	{"Лимфоциты (LYM%)", "lymphocytes_percent", "%", []string{"lym%"}, 100},
+	{"Моноциты (MON%)", "monocytes_percent", "%", []string{"mon%"}, 100},
+	{"Гранулоциты (GRAN%)", "granulocytes_percent", "%", []string{"gran%"}, 100},
+	{"Микроальбумин", "urine_microalbumin", "мг/сут", []string{"микроальбумин"}, 10000},
+	{"pH мочи", "urine_ph", "", []string{"ph"}, 14},
+	{"Относительная плотность", "specific_gravity", "", []string{"относительная плотность", "удельный вес"}, 2},
 }
 
 var (
@@ -509,6 +686,8 @@ func parseMarkers(text string) []domain.Marker {
 func parseKnownMarkers(text string) []domain.Marker {
 	found := map[string]domain.Marker{}
 	for _, line := range markerSegments(text) {
+		synthetic := strings.HasPrefix(line, syntheticSegmentPrefix)
+		line = strings.TrimPrefix(line, syntheticSegmentPrefix)
 		lower := strings.ToLower(strings.ReplaceAll(line, "ё", "е"))
 		for _, spec := range markerSpecs {
 			alias, index := matchedAlias(lower, spec.aliases)
@@ -527,6 +706,10 @@ func parseKnownMarkers(text string) []domain.Marker {
 			rawValue := value
 			value = normalizeMarkerValue(value, numbers[0], spec.maxPlausible)
 			marker := domain.Marker{Name: spec.name, CanonicalName: spec.canonical, Value: floatPtr(value), Unit: spec.unit, Status: domain.StatusUnknown, Confidence: 0.74}
+			if synthetic {
+				marker.Confidence = 0.52
+				marker.Warnings = append(marker.Warnings, "Значение собрано из раздельных строк OCR — обязательно сверьте с оригиналом.")
+			}
 			if value != rawValue {
 				marker.Warnings = append(marker.Warnings, "OCR потерял десятичный разделитель результата.")
 				marker.Confidence = 0.62
@@ -543,7 +726,7 @@ func parseKnownMarkers(text string) []domain.Marker {
 				b, okB := parseOCRNumber(match[2])
 				if okA && okB {
 					rawA, rawB := a, b
-					a, b = normalizeReferenceRange(value, a, b, hint)
+					a, b = normalizeReferenceRange(value, a, b, hint, spec.unit)
 					marker.ReferenceMin, marker.ReferenceMax = floatPtr(a), floatPtr(b)
 					marker.ReferenceText = formatReference(a, b)
 					marker.Status = statusForRange(value, a, b)
@@ -587,6 +770,9 @@ func parseKnownMarkers(text string) []domain.Marker {
 			if hint != domain.StatusUnknown {
 				marker.Status = hint
 			}
+			if spec.canonical == "crp" && marker.ReferenceMin == nil && marker.ReferenceMax == nil && marker.Status == domain.StatusUnknown {
+				continue
+			}
 			if marker.Value != nil && marker.ReferenceMin != nil && marker.ReferenceMax != nil {
 				// A sparse OCR pass can mistake the first reference boundary for
 				// the result. Treat an exact boundary as uncertain instead of using
@@ -611,6 +797,13 @@ func parseKnownMarkers(text string) []domain.Marker {
 					}
 				}
 			}
+			if synthetic {
+				marker.Confidence = minFloat(marker.Confidence, 0.58)
+				if spec.unit == "%" {
+					marker.ReferenceMin, marker.ReferenceMax, marker.ReferenceText = nil, nil, ""
+					marker.Status = domain.StatusUnknown
+				}
+			}
 			if existing, exists := found[spec.canonical]; !exists || markerScore(marker) > markerScore(existing) {
 				found[spec.canonical] = marker
 			}
@@ -621,6 +814,83 @@ func parseKnownMarkers(text string) []domain.Marker {
 		if marker, ok := found[spec.canonical]; ok {
 			out = append(out, marker)
 		}
+	}
+	for _, marker := range parseUrinalysisTextMarkers(text) {
+		if _, exists := found[marker.CanonicalName]; !exists {
+			out = append(out, marker)
+		}
+	}
+	return out
+}
+
+func parseUrinalysisTextMarkers(text string) []domain.Marker {
+	lowerDocument := strings.ToLower(strings.ReplaceAll(text, "ё", "е"))
+	if !strings.Contains(lowerDocument, "анализ моч") && !strings.Contains(lowerDocument, "осадка моч") && !strings.Contains(lowerDocument, "относительная плотность") {
+		return nil
+	}
+	type textSpec struct {
+		name, canonical string
+		aliases         []string
+		visual          bool
+	}
+	specs := []textSpec{
+		{"Аскорбиновая кислота", "urine_ascorbic_acid", []string{"аскорбиновая кислота"}, false},
+		{"Нитриты", "urine_nitrites", []string{"нитриты"}, false},
+		{"Эритроциты", "urine_erythrocytes", []string{"эритроциты"}, false},
+		{"Лейкоциты", "urine_leukocytes", []string{"лейкоциты"}, false},
+		{"Кетоновые тела", "urine_ketones", []string{"кетоновые тела"}, false},
+		{"Уробилиноген", "urine_urobilinogen", []string{"уробилиноген"}, false},
+		{"Билирубин", "urine_bilirubin", []string{"билирубин"}, false},
+		{"Глюкоза", "urine_glucose", []string{"глюкоза"}, false},
+		{"Белок", "urine_protein", []string{"белок"}, false},
+		{"Бактерии", "urine_bacteria", []string{"бактерии"}, false},
+		{"Слизь", "urine_mucus", []string{"слизь"}, false},
+		{"Прозрачность", "urine_clarity", []string{"прозрачность"}, true},
+		{"Цвет", "urine_color", []string{"цвет"}, true},
+		{"Эпителий плоский", "urine_squamous_epithelium", []string{"эпителий плоский"}, true},
+	}
+	lines := strings.Split(text, "\n")
+	found := map[string]domain.Marker{}
+	for _, rawLine := range lines {
+		line := strings.Join(strings.Fields(rawLine), " ")
+		lower := strings.ToLower(strings.ReplaceAll(line, "ё", "е"))
+		for _, spec := range specs {
+			alias, index := matchedAlias(lower, spec.aliases)
+			if index < 0 {
+				continue
+			}
+			value := strings.Trim(strings.TrimSpace(line[index+len(alias):]), ":;|-—")
+			if value == "" {
+				continue
+			}
+			marker := domain.Marker{Name: spec.name, CanonicalName: spec.canonical, TextValue: value, Status: domain.StatusUnknown, Confidence: 0.8}
+			valueLower := strings.ToLower(strings.ReplaceAll(value, "ё", "е"))
+			if strings.Contains(value, "+") {
+				marker.Status = domain.StatusHigh
+			} else if !spec.visual && (strings.Contains(valueLower, "отриц") || strings.Contains(valueLower, "норма")) {
+				marker.Status = domain.StatusNormal
+			}
+			if regexp.MustCompile(`\d+\s*[-–]\s*\d+`).MatchString(value) {
+				marker.Unit = "в п/зр"
+				marker.Status = domain.StatusUnknown
+				if marker.CanonicalName == "urine_leukocytes" {
+					marker.Name = "Лейкоциты (микроскопия)"
+					marker.CanonicalName = "urine_leukocytes_microscopy"
+				}
+			}
+			if existing, exists := found[marker.CanonicalName]; !exists || len([]rune(marker.TextValue)) > len([]rune(existing.TextValue)) {
+				found[marker.CanonicalName] = marker
+			}
+		}
+	}
+	out := make([]domain.Marker, 0, len(found))
+	for _, spec := range specs {
+		if marker, ok := found[spec.canonical]; ok {
+			out = append(out, marker)
+		}
+	}
+	if marker, ok := found["urine_leukocytes_microscopy"]; ok {
+		out = append(out, marker)
 	}
 	return out
 }
@@ -660,6 +930,8 @@ func repairCollapsedReference(canonical string, value float64, tokens []string) 
 // cell on a separate line. Synthetic segments join a marker heading with the
 // following cells until the next marker heading, allowing both layouts to use
 // the same strict parser without joining unrelated rows.
+const syntheticSegmentPrefix = "\x1f"
+
 func markerSegments(text string) []string {
 	raw := strings.Split(text, "\n")
 	lines := make([]string, 0, len(raw))
@@ -691,7 +963,7 @@ func markerSegments(text string) []string {
 			parts = append(parts, lines[j])
 		}
 		if len(parts) > 1 {
-			segments = append(segments, strings.Join(parts, " "))
+			segments = append(segments, syntheticSegmentPrefix+strings.Join(parts, " "))
 		}
 	}
 	return segments
@@ -729,60 +1001,49 @@ func parseOCRCandidates(texts []string) []domain.Marker {
 	if len(texts) == 0 {
 		return []domain.Marker{}
 	}
-	byCanonical := map[string][]domain.Marker{}
+	selected := map[string]domain.Marker{}
 	order := []string{}
-	for _, text := range texts {
+	for pass, text := range texts {
 		for _, marker := range parseMarkers(text) {
-			if _, exists := byCanonical[marker.CanonicalName]; !exists {
+			current, exists := selected[marker.CanonicalName]
+			if !exists {
 				order = append(order, marker.CanonicalName)
+				selected[marker.CanonicalName] = marker
+				continue
 			}
-			byCanonical[marker.CanonicalName] = append(byCanonical[marker.CanonicalName], marker)
+			if markerValuesAgree(current, marker) {
+				if current.ReferenceMin == nil && current.ReferenceMax == nil && marker.Confidence >= 0.7 {
+					current.ReferenceMin, current.ReferenceMax, current.ReferenceText = marker.ReferenceMin, marker.ReferenceMax, marker.ReferenceText
+					if marker.ReferenceMin != nil || marker.ReferenceMax != nil {
+						current.Status = marker.Status
+					}
+				}
+				current.Confidence = maxFloat(current.Confidence, minFloat(0.96, marker.Confidence+0.06))
+				current.Warnings = appendUnique(current.Warnings, marker.Warnings...)
+				selected[marker.CanonicalName] = current
+				continue
+			}
+			if current.Confidence < 0.7 && marker.Confidence >= 0.7 && pass > 0 {
+				marker.Warnings = appendUnique(marker.Warnings, "Режимы OCR прочитали значение по-разному — сверьте с оригиналом.")
+				marker.Confidence = minFloat(marker.Confidence, 0.68)
+				selected[marker.CanonicalName] = marker
+			} else {
+				current.Confidence = minFloat(current.Confidence, 0.58)
+				current.Warnings = appendUnique(current.Warnings, "Режимы OCR прочитали значение по-разному — сохранён результат табличного режима.")
+				selected[marker.CanonicalName] = current
+			}
 		}
 	}
 	out := make([]domain.Marker, 0, len(order))
 	for _, canonical := range order {
-		candidates := byCanonical[canonical]
-		bestIndex, bestVotes, bestScore := 0, 0, -1
-		credibleCount := 0
-		for _, candidate := range candidates {
-			if candidate.Confidence >= 0.7 {
-				credibleCount++
-			}
-		}
-		for i, candidate := range candidates {
-			votes := 0
-			for _, other := range candidates {
-				if other.Confidence >= 0.7 && markerValuesAgree(candidate, other) {
-					votes++
-				}
-			}
-			score := votes*100 + markerScore(candidate)
-			if score > bestScore {
-				bestIndex, bestVotes, bestScore = i, votes, score
-			}
-		}
-		best := candidates[bestIndex]
-		for _, candidate := range candidates {
-			if markerValuesAgree(best, candidate) && markerScore(candidate) > markerScore(best) {
-				candidate.Warnings = appendUnique(candidate.Warnings, best.Warnings...)
-				best = candidate
-			}
-		}
-		if bestVotes >= 2 {
-			best.Confidence = maxFloat(best.Confidence, minFloat(0.98, 0.84+float64(bestVotes)*0.06))
-		}
-		if credibleCount > 1 && bestVotes < credibleCount {
-			best.Confidence = minFloat(best.Confidence, 0.58)
-			best.Warnings = appendUnique(best.Warnings, "Режимы OCR прочитали значение по-разному.")
-		}
-		out = append(out, best)
+		out = append(out, selected[canonical])
 	}
 	return out
 }
 
 func markerValuesAgree(a, b domain.Marker) bool {
 	if a.Value == nil || b.Value == nil {
-		return a.Value == nil && b.Value == nil
+		return a.Value == nil && b.Value == nil && strings.EqualFold(strings.TrimSpace(a.TextValue), strings.TrimSpace(b.TextValue))
 	}
 	tolerance := maxFloat(0.011, maxFloat(absFloat(*a.Value), absFloat(*b.Value))*0.002)
 	return absFloat(*a.Value-*b.Value) <= tolerance
@@ -822,6 +1083,13 @@ func maxFloat(a, b float64) float64 {
 
 func matchedAlias(line string, aliases []string) (string, int) {
 	for _, alias := range aliases {
+		if len([]rune(alias)) <= 3 && !strings.ContainsAny(alias, " -_/()") {
+			pattern := regexp.MustCompile(`(?i)(^|[^\p{L}])(` + regexp.QuoteMeta(alias) + `)(?:[^\p{L}]|$)`)
+			if match := pattern.FindStringSubmatchIndex(line); match != nil {
+				return line[match[4]:match[5]], match[4]
+			}
+			continue
+		}
 		if index := strings.Index(line, alias); index >= 0 {
 			return alias, index
 		}
@@ -845,7 +1113,13 @@ func normalizeMarkerValue(value float64, raw string, maxPlausible float64) float
 	return value
 }
 
-func normalizeReferenceRange(value, rawMin, rawMax float64, hint domain.MarkerStatus) (float64, float64) {
+func normalizeReferenceRange(value, rawMin, rawMax float64, hint domain.MarkerStatus, unit string) (float64, float64) {
+	// Percent ranges such as 50–70 are already naturally bounded. Dividing them
+	// to force the measured value inside the range would silently turn a real
+	// low/high flag into “normal”.
+	if unit == "%" && rawMin >= 0 && rawMax <= 100 {
+		return rawMin, rawMax
+	}
 	if value == 0 {
 		return rawMin, rawMax
 	}

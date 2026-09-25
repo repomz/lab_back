@@ -927,24 +927,41 @@ func (a *API) confirmAnalysis(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Markers []domain.Marker `json:"markers"`
+		Markers []domain.Marker     `json:"markers"`
+		Report  *domain.StudyReport `json:"report"`
 	}
 	if decode(r, &in) != nil {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	markers, err := analyzer.NormalizeConfirmedMarkers(in.Markers)
-	if err != nil {
-		write(w, 422, map[string]string{"error": "check marker values"})
-		return
-	}
 	patient, _ := a.store.UserByID(r.Context(), u.ID)
-	review := a.analyzer.ReviewMarkersForPatient(r.Context(), markers, patient.PatientProfile)
-	if err = a.store.ConfirmAnalysis(r.Context(), id, u.ID, markers, review); err != nil {
+	markers := []domain.Marker{}
+	var report *domain.StudyReport
+	var review domain.AIReview
+	if in.Report != nil || (len(in.Markers) == 0 && item.Report != nil) {
+		candidate := in.Report
+		if candidate == nil {
+			candidate = item.Report
+		}
+		report, err = analyzer.NormalizeConfirmedReport(candidate)
+		if err != nil {
+			write(w, 422, map[string]string{"error": "check study text"})
+			return
+		}
+		review = a.analyzer.ReviewStudyReportForPatient(r.Context(), report, patient.PatientProfile)
+	} else {
+		markers, err = analyzer.NormalizeConfirmedMarkers(in.Markers)
+		if err != nil {
+			write(w, 422, map[string]string{"error": "check marker values"})
+			return
+		}
+		review = a.analyzer.ReviewMarkersForPatient(r.Context(), markers, patient.PatientProfile)
+	}
+	if err = a.store.ConfirmAnalysis(r.Context(), id, u.ID, markers, report, review); err != nil {
 		write(w, 500, map[string]string{"error": "could not confirm analysis"})
 		return
 	}
-	item.Markers, item.AIReview, item.Status, item.ProcessingStage, item.ProcessingProgress = markers, review, domain.AnalysisStatusReady, domain.ProcessingStageCompleted, 100
+	item.Markers, item.Report, item.AIReview, item.Status, item.ProcessingStage, item.ProcessingProgress = markers, report, review, domain.AnalysisStatusReady, domain.ProcessingStageCompleted, 100
 	write(w, 200, item)
 }
 func (a *API) share(w http.ResponseWriter, r *http.Request) {

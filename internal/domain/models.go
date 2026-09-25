@@ -128,6 +128,19 @@ type AIReview struct {
 	Provider           string   `bson:"provider" json:"provider"`
 }
 
+// StudyReport stores narrative diagnostic studies (US, CT, MRI, X-ray)
+// separately from laboratory markers. Keeping the source description and the
+// explicit conclusion distinct prevents a language model from turning body
+// text into a diagnosis that was not present in the document.
+type StudyReport struct {
+	Modality    string   `bson:"modality" json:"modality"`
+	StudyName   string   `bson:"study_name" json:"study_name"`
+	Description string   `bson:"description" json:"description"`
+	Conclusion  string   `bson:"conclusion,omitempty" json:"conclusion,omitempty"`
+	Confidence  float64  `bson:"confidence,omitempty" json:"confidence,omitempty"`
+	Warnings    []string `bson:"warnings,omitempty" json:"warnings,omitempty"`
+}
+
 const (
 	AnalysisStatusQueued               = "queued"
 	AnalysisStatusProcessing           = "processing"
@@ -161,6 +174,7 @@ type Analysis struct {
 	StoragePath           string               `bson:"storage_path" json:"-"`
 	OCRText               string               `bson:"ocr_text,omitempty" json:"ocr_text,omitempty"`
 	Markers               []Marker             `bson:"markers" json:"markers"`
+	Report                *StudyReport         `bson:"report,omitempty" json:"report,omitempty"`
 	AIReview              AIReview             `bson:"ai_review" json:"ai_review"`
 	Status                string               `bson:"status" json:"status"`
 	ProcessingStage       string               `bson:"processing_stage,omitempty" json:"processing_stage,omitempty"`

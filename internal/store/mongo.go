@@ -288,9 +288,9 @@ func (s *Mongo) UpdateOCRJobProgress(ctx context.Context, id primitive.ObjectID,
 	return err
 }
 
-func (s *Mongo) CompleteOCRJob(ctx context.Context, job domain.Analysis, worker, text string, markers []domain.Marker, status, title, category string, collectedAt *time.Time) error {
+func (s *Mongo) CompleteOCRJob(ctx context.Context, job domain.Analysis, worker, text string, markers []domain.Marker, report *domain.StudyReport, status, title, category string, collectedAt *time.Time) error {
 	now := time.Now().UTC()
-	set := bson.M{"ocr_text": text, "markers": markers, "ai_review": domain.AIReview{}, "status": status, "title": title, "category": category, "processing_stage": domain.ProcessingStageVerification, "processing_progress": 100, "processing_error": "", "processing_completed_at": now, "updated_at": now}
+	set := bson.M{"ocr_text": text, "markers": markers, "report": report, "ai_review": domain.AIReview{}, "status": status, "title": title, "category": category, "processing_stage": domain.ProcessingStageVerification, "processing_progress": 100, "processing_error": "", "processing_completed_at": now, "updated_at": now}
 	if collectedAt != nil {
 		set["collected_at"] = collectedAt
 	}
@@ -631,11 +631,11 @@ func (s *Mongo) UpdateAnalysisRecognition(ctx context.Context, id, owner primiti
 	return err
 }
 
-func (s *Mongo) ConfirmAnalysis(ctx context.Context, id, owner primitive.ObjectID, markers []domain.Marker, review domain.AIReview) error {
+func (s *Mongo) ConfirmAnalysis(ctx context.Context, id, owner primitive.ObjectID, markers []domain.Marker, report *domain.StudyReport, review domain.AIReview) error {
 	now := time.Now().UTC()
 	r, err := s.db.Collection("analyses").UpdateOne(ctx,
 		bson.M{"_id": id, "owner_id": owner},
-		bson.M{"$set": bson.M{"markers": markers, "ai_review": review, "status": domain.AnalysisStatusReady, "processing_stage": domain.ProcessingStageCompleted, "processing_progress": 100, "processing_completed_at": now, "updated_at": now}},
+		bson.M{"$set": bson.M{"markers": markers, "report": report, "ai_review": review, "status": domain.AnalysisStatusReady, "processing_stage": domain.ProcessingStageCompleted, "processing_progress": 100, "processing_completed_at": now, "updated_at": now}},
 	)
 	if err == nil && r.MatchedCount == 0 {
 		return mongo.ErrNoDocuments
