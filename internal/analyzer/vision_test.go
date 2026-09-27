@@ -64,3 +64,53 @@ func TestSanitizeMedicalTextDropsPatientIdentifiers(t *testing.T) {
 		t.Fatalf("unexpected retained text: %q", got)
 	}
 }
+
+func TestMultipleStudiesKeepSpecimensAndReviewsSeparate(t *testing.T) {
+	var extracted visionExtraction
+	if err := json.Unmarshal([]byte(`{"studies":[
+	{"medical_text":"Общий анализ крови. WBC 6,70; 4–10","markers":[{"name":"WBC","canonical_name":"WBC","value":6.7,"reference_min":4,"reference_max":10,"reference_text":"4–10"}]},
+	{"medical_text":"Исследование на микроальбуминурию. Микроальбумин 0,60; 0–25 мг/сутки","markers":[{"name":"Микроальбумин","canonical_name":"Microalbumin","value":0.6,"unit":"мг/сутки","reference_min":0,"reference_max":25,"reference_text":"0–25"}]},
+	{"medical_text":"УЗИ почек","report":{"modality":"УЗИ","study_name":"УЗИ почек","description":"Контуры чёткие, ровные.","conclusion":"Эхоскопически без выраженной патологии.","confidence":1}}
+	]}`), &extracted); err != nil {
+		t.Fatal(err)
+	}
+	results, err := New(config.Config{}).finishVisionStudies(context.Background(), extracted, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("lost studies: %d", len(results))
+	}
+	if results[0].Title != "Общий анализ крови" || results[1].Title != "Микроальбумин мочи" || results[2].Title != "УЗИ почек" {
+		t.Fatalf("wrong identities: %#v", results)
+	}
+	if len(results[0].Markers) != 1 || len(results[1].Markers) != 1 || len(results[2].Markers) != 0 {
+		t.Fatal("mixed study data")
+	}
+	if results[1].Markers[0].Value == nil || *results[1].Markers[0].Value != 0.6 || *results[1].Markers[0].ReferenceMax != 25 {
+		t.Fatal("urine values changed")
+	}
+	for _, result := range results {
+		if result.Review.Summary == "" {
+			t.Fatal("missing per-study review")
+		}
+	}
+}
+
+func TestInvalidStudyRejectsEntireDocument(t *testing.T) {
+	service := New(config.Config{})
+	for _, raw := range []string{
+		`{"studies":[{"markers":[{"name":"WBC","value":6.7}]},{}]}`,
+		`{"studies":[{"markers":[{"name":"WBC","value":6.7},{"name":"Микроальбумин","value":0.6}]}]}`,
+		`{"studies":[{"studies":[{}]}]}`,
+	} {
+		var extracted visionExtraction
+		if err := json.Unmarshal([]byte(raw), &extracted); err != nil {
+			t.Fatal(err)
+		}
+		results, err := service.finishVisionStudies(context.Background(), extracted, nil)
+		if err == nil || results != nil {
+			t.Fatalf("partial or mixed result accepted: %s", raw)
+		}
+	}
+}

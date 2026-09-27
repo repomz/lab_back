@@ -420,16 +420,19 @@ func TestClassifyAnalysisFromRecognizedMarkers(t *testing.T) {
 	}
 }
 
-func TestCanonicalIdentityKeepsMixedBloodAndUrineDocumentReadable(t *testing.T) {
+func TestCanonicalIdentityForSeparateBloodAndUrineStudies(t *testing.T) {
 	markers := []domain.Marker{
 		{Name: "WBC", CanonicalName: "WBC"},
 		{Name: "RBC", CanonicalName: "RBC"},
 		{Name: "PLT", CanonicalName: "PLT"},
-		{Name: "Микроальбумин", CanonicalName: "Microalbumin"},
 	}
-	title, category := CanonicalAnalysisIdentity(markers, "Общий анализ крови развернутый. Исследование на микроальбуминурию", nil)
-	if title != "Общий анализ крови и микроальбумин мочи" || category != "Кровь" {
+	title, category := CanonicalAnalysisIdentity(markers, "Общий анализ крови развернутый", nil)
+	if title != "Общий анализ крови" || category != "Кровь" {
 		t.Fatalf("unexpected identity: %q / %q", title, category)
+	}
+	title, category = CanonicalAnalysisIdentity([]domain.Marker{{Name: "Микроальбумин", CanonicalName: "Microalbumin"}}, "Исследование на микроальбуминурию", nil)
+	if title != "Микроальбумин мочи" || category != "Моча" {
+		t.Fatalf("unexpected urine identity: %q / %q", title, category)
 	}
 }
 

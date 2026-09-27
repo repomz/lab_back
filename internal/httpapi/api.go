@@ -787,7 +787,7 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	startedAt := time.Now().UTC()
-	result, analysisErr := a.analyzer.AnalyzeDocumentForPatient(r.Context(), path, mime, patient.PatientProfile)
+	results, analysisErr := a.analyzer.AnalyzeDocumentsForPatient(r.Context(), path, mime, patient.PatientProfile)
 	if analysisErr != nil {
 		_ = os.Remove(path)
 		_ = os.Remove(dir)
@@ -797,15 +797,15 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 	}
 	completedAt := time.Now().UTC()
 	item := domain.Analysis{
-		ID: id, OwnerID: u.ID, Title: result.Title, Category: result.Category, CollectedAt: result.CollectedAt,
+		ID: id, OwnerID: u.ID,
 		OriginalName: filepath.Base(header.Filename), MimeType: mime, StoragePath: path,
-		OCRText: result.MedicalText, Markers: result.Markers, Report: result.Report, AIReview: result.Review, Status: domain.AnalysisStatusReady,
+		Status:          domain.AnalysisStatusReady,
 		ProcessingStage: domain.ProcessingStageCompleted, ProcessingProgress: 100, ProcessingAttempt: 1,
 		ProcessingStartedAt: &startedAt, ProcessingCompletedAt: &completedAt,
 		SharedWith: []primitive.ObjectID{}, IsDeveloper: patient.IsDeveloper,
 	}
-	if e = a.store.CreateAnalysis(r.Context(), &item); e != nil {
-		_ = os.Remove(path)
+	item, e = a.saveStudies(r.Context(), item, results, false)
+	if e != nil {
 		write(w, 500, map[string]string{"error": "could not save analysis"})
 		return
 	}
@@ -935,19 +935,28 @@ func (a *API) reprocess(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	startedAt := time.Now().UTC()
-	result, err := a.analyzer.AnalyzeDocumentForPatient(r.Context(), item.StoragePath, item.MimeType, patient.PatientProfile)
+	results, err := a.analyzer.AnalyzeDocumentsForPatient(r.Context(), item.StoragePath, item.MimeType, patient.PatientProfile)
 	if err != nil {
 		writeAIServiceError(w, err, http.StatusBadGateway, "Не удалось достоверно распознать документ. Проверьте оригинал и повторите попытку.")
 		return
 	}
-	item.Title, item.Category, item.CollectedAt = result.Title, result.Category, result.CollectedAt
-	item.OCRText, item.Markers, item.Report, item.AIReview = result.MedicalText, result.Markers, result.Report, result.Review
-	item.Status, item.ProcessingStage, item.ProcessingProgress = domain.AnalysisStatusReady, domain.ProcessingStageCompleted, 100
 	item.ProcessingAttempt++
 	item.ProcessingStartedAt = &startedAt
 	completedAt := time.Now().UTC()
 	item.ProcessingCompletedAt = &completedAt
-	if err = a.store.ReplaceAnalysisResult(r.Context(), id, u.ID, item); err != nil {
+	if item.SourceStudyCount > 1 {
+		var result analyzer.DocumentResult
+		result, err = selectStudy(analyzer.PresentAnalysis(item), results)
+		if err != nil {
+			write(w, http.StatusConflict, map[string]string{"error": err.Error()})
+			return
+		}
+		item = applyStudyResult(item, result, item.SourceStudyIndex, item.SourceStudyCount)
+		err = a.store.ReplaceAnalysisResult(r.Context(), id, u.ID, item)
+	} else {
+		item, err = a.saveStudies(r.Context(), item, results, true)
+	}
+	if err != nil {
 		write(w, 500, map[string]string{"error": "could not save recognition result"})
 		return
 	}

@@ -359,12 +359,15 @@ func (s *Mongo) ReplaceAnalysisResult(ctx context.Context, id, owner primitive.O
 		"processing_progress": 100, "processing_attempt": result.ProcessingAttempt,
 		"processing_error": "", "processing_started_at": result.ProcessingStartedAt,
 		"processing_completed_at": now, "updated_at": now,
+		"source_study_index": result.SourceStudyIndex, "source_study_count": result.SourceStudyCount,
+		"collected_at": result.CollectedAt,
 	}
-	if result.CollectedAt != nil {
-		set["collected_at"] = result.CollectedAt
+	filter := bson.M{"_id": id, "owner_id": owner}
+	if !result.UpdatedAt.IsZero() {
+		filter["updated_at"] = result.UpdatedAt
 	}
 	r, err := s.db.Collection("analyses").UpdateOne(ctx,
-		bson.M{"_id": id, "owner_id": owner},
+		filter,
 		bson.M{"$set": set, "$unset": bson.M{"processing_worker": "", "processing_lease_until": "", "processing_next_attempt_at": ""}},
 	)
 	if err == nil && r.MatchedCount == 0 {

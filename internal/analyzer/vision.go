@@ -30,6 +30,7 @@ type DocumentResult struct {
 }
 
 type visionExtraction struct {
+	Studies      []visionExtraction  `json:"studies,omitempty"`
 	DocumentType string              `json:"document_type"`
 	Title        string              `json:"title"`
 	Category     string              `json:"category"`
@@ -61,15 +62,26 @@ type visionImage struct {
 // one uninterrupted request. It intentionally does not fall back to publishing
 // uncertain Tesseract output as a successful result.
 func (s *Service) AnalyzeDocumentForPatient(ctx context.Context, path, mime string, profile *domain.PatientProfile) (DocumentResult, error) {
+	results, err := s.AnalyzeDocumentsForPatient(ctx, path, mime, profile)
+	if err != nil {
+		return DocumentResult{}, err
+	}
+	if len(results) != 1 {
+		return DocumentResult{}, fmt.Errorf("document contains %d separate studies", len(results))
+	}
+	return results[0], nil
+}
+
+func (s *Service) AnalyzeDocumentsForPatient(ctx context.Context, path, mime string, profile *domain.PatientProfile) ([]DocumentResult, error) {
 	if strings.TrimSpace(s.cfg.DeepSeekAPIKey) == "" {
-		return DocumentResult{}, fmt.Errorf("visual recognition is not configured")
+		return nil, fmt.Errorf("visual recognition is not configured")
 	}
 	images, cleanup, err := prepareVisionImages(ctx, path, mime)
 	if cleanup != nil {
 		defer cleanup()
 	}
 	if err != nil {
-		return DocumentResult{}, err
+		return nil, err
 	}
 
 	content := make([]map[string]any, 0, len(images)+1)
@@ -95,19 +107,60 @@ func (s *Service) AnalyzeDocumentForPatient(ctx context.Context, path, mime stri
 	}
 	response, err := s.requestDeepSeekVision(ctx, payload)
 	if err != nil {
-		return DocumentResult{}, fmt.Errorf("visual recognition: %w", err)
+		return nil, fmt.Errorf("visual recognition: %w", err)
 	}
 	var extracted visionExtraction
 	if err = json.Unmarshal([]byte(response), &extracted); err != nil {
-		return DocumentResult{}, fmt.Errorf("invalid visual recognition response: %w", err)
+		return nil, fmt.Errorf("invalid visual recognition response: %w", err)
 	}
 	// A second visual pass compares the draft against the original pixels. It
 	// catches column shifts and easily confused glyphs (I/1, decimal commas,
 	// abbreviations) without using generic medical ranges as a substitute.
-	if verified, verifyErr := s.verifyVisionExtraction(ctx, images, extracted); verifyErr == nil {
-		extracted = verified
+	verified, verifyErr := s.verifyVisionExtraction(ctx, images, extracted)
+	if verifyErr != nil {
+		return nil, fmt.Errorf("visual verification: %w", verifyErr)
 	}
-	return s.finishVisionExtraction(ctx, extracted, profile)
+	return s.finishVisionStudies(ctx, verified, profile)
+}
+
+func (s *Service) finishVisionStudies(ctx context.Context, extracted visionExtraction, profile *domain.PatientProfile) ([]DocumentResult, error) {
+	studies := extracted.Studies
+	if len(studies) == 0 {
+		studies = []visionExtraction{extracted}
+	}
+	if len(studies) > 20 {
+		return nil, fmt.Errorf("too many studies in document")
+	}
+	results := make([]DocumentResult, 0, len(studies))
+	for _, study := range studies {
+		if len(study.Studies) > 0 {
+			return nil, fmt.Errorf("nested study groups are invalid")
+		}
+		if len(study.Markers) > 0 && study.Report != nil {
+			return nil, fmt.Errorf("laboratory and diagnostic studies must be separate")
+		}
+		// Do not silently publish the known cross-specimen failure even if both
+		// model passes repeat it. Ask for another attempt instead of mislabelling.
+		hasBlood, hasMicroalbumin := false, false
+		for _, marker := range study.Markers {
+			key := normalizeSearch(marker.CanonicalName + " " + marker.Name)
+			if containsAny(key, "microalbumin", "микроальбумин") {
+				hasMicroalbumin = true
+			}
+			if containsAny(key, "wbc", "rbc", "hgb", "plt", "гемоглобин", "тромбоцит") {
+				hasBlood = true
+			}
+		}
+		if hasBlood && hasMicroalbumin {
+			return nil, fmt.Errorf("blood count and urine microalbumin must be separate studies")
+		}
+		result, err := s.finishVisionExtraction(ctx, study, profile)
+		if err != nil {
+			return nil, err
+		}
+		results = append(results, result)
+	}
+	return results, nil
 }
 
 func (s *Service) verifyVisionExtraction(ctx context.Context, images []visionImage, draft visionExtraction) (visionExtraction, error) {
@@ -115,7 +168,7 @@ func (s *Service) verifyVisionExtraction(ctx context.Context, images []visionIma
 	if err != nil {
 		return visionExtraction{}, err
 	}
-	content := []map[string]any{{"type": "text", "text": `Повторно сверь черновик с оригинальными страницами посимвольно. Исправь только реальные расхождения с изображением: пропущенные строки, перепутанные колонки, цифры, десятичные знаки, I/1, сокращения, единицы, референсы, описание и заключение. Не исправляй опечатки самого исходного документа, не добавляй типовые нормы и не делай медицинских выводов. Верни полный исправленный JSON в той же схеме. Черновик: ` + string(draftJSON)}}
+	content := []map[string]any{{"type": "text", "text": `Повторно сверь черновик с оригинальными страницами посимвольно. Проверь границы исследований: разные бланки, биоматериалы, даты или протоколы должны быть отдельными элементами studies; продолжения одного бланка объедини, не дублируй. ОАК и микроальбумин мочи обязательно раздели. Исправь только реальные расхождения с изображением: пропущенные строки, перепутанные колонки, цифры, десятичные знаки, I/1, сокращения, единицы, референсы, описание и заключение. Не исправляй опечатки самого исходного документа, не добавляй типовые нормы и не делай медицинских выводов. Верни полный исправленный JSON в той же схеме. Черновик: ` + string(draftJSON)}}
 	for _, image := range images {
 		content = append(content, map[string]any{
 			"type":      "image_url",
@@ -146,7 +199,9 @@ func (s *Service) verifyVisionExtraction(ctx context.Context, images []visionIma
 	return verified, nil
 }
 
-const visionExtractionPrompt = `Прочитай все приложенные страницы как один медицинский документ.
+const visionExtractionPrompt = `Прочитай все приложенные страницы и выдели каждое самостоятельное исследование.
+Одна фотография или PDF может содержать 2, 3 и более разных исследований. Верни их отдельными элементами studies с собственными датой, показателями, описанием, заключением и названием.
+Разделяй по заголовкам бланков, виду исследования, биоматериалу, дате и номеру образца. ОАК с лейкоформулой и СОЭ одного образца оставь вместе; микроальбумин мочи на том же листе — отдельное исследование. УЗИ разных органов с самостоятельными протоколами разделяй. Продолжение одного бланка на следующей странице объедини. Не дублируй строки и не дроби один профиль на отдельные показатели. Не смешивай кровь и мочу.
 Требования к точности:
 1. Не угадывай и не исправляй значения по медицинским знаниям. Используй только то, что видно на бланке.
 2. Для лабораторной таблицы верни каждую строку исследования. Результат, единицу и референс бери только из той же строки/колонки. Если референс на бланке пуст, все reference-поля должны быть null/пустыми.
@@ -157,7 +212,7 @@ const visionExtractionPrompt = `Прочитай все приложенные �
 7. medical_text должен содержать аккуратную транскрипцию только медицинской части документа без ФИО, адреса, полиса, номера карты и иных идентификаторов пациента.
 8. collected_at — дата забора материала или дата исследования в YYYY-MM-DD; не дата рождения, печати или направления. Если её нет, пустая строка.
 9. title — короткое понятное название вида исследования, без перечисления всех строк бланка. category не является свободным текстом: выбери одну рубрику из «Кровь», «Моча», «УЗИ», «КТ и МРТ», «Рентген», «Другие анализы».
-Верни JSON строго такой формы:
+Верни JSON {"studies":[...]} даже для одного исследования. Каждый элемент массива строго такой формы:
 {"document_type":"laboratory|diagnostic","title":"краткое название исследования","category":"категория","collected_at":"YYYY-MM-DD или пусто","medical_text":"транскрипция медицинской части","markers":[{"name":"как на бланке","canonical_name":"стабильное английское имя или транслитерация","value":null,"text_value":"","unit":"","reference_min":null,"reference_max":null,"reference_text":"","status":"low|normal|high|unknown"}],"report":null}
 Для диагностического исследования markers=[] и report={"modality":"УЗИ|КТ|МРТ|Рентген","study_name":"название","description":"дословное описание","conclusion":"дословное заключение","confidence":1,"warnings":[]}.`
 
@@ -270,20 +325,33 @@ func (m visionMarker) domainMarker() (domain.Marker, error) {
 
 func prepareVisionImages(ctx context.Context, path, mime string) ([]visionImage, func(), error) {
 	if strings.Contains(strings.ToLower(mime), "pdf") {
+		info, err := exec.CommandContext(ctx, "pdfinfo", path).Output()
+		if err != nil {
+			return nil, nil, fmt.Errorf("cannot read PDF page count: %w", err)
+		}
+		pageCount := 0
+		for _, line := range strings.Split(string(info), "\n") {
+			if strings.HasPrefix(line, "Pages:") {
+				pageCount, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "Pages:")))
+			}
+		}
+		if pageCount < 1 || pageCount > 10 {
+			return nil, nil, fmt.Errorf("PDF must contain 1–10 pages; split longer documents before uploading")
+		}
 		dir, err := os.MkdirTemp("", "lab-vision-pdf-")
 		if err != nil {
 			return nil, nil, err
 		}
 		cleanup := func() { _ = os.RemoveAll(dir) }
 		prefix := filepath.Join(dir, "page")
-		if output, renderErr := exec.CommandContext(ctx, "pdftoppm", "-jpeg", "-r", "180", "-f", "1", "-l", "5", path, prefix).CombinedOutput(); renderErr != nil {
+		if output, renderErr := exec.CommandContext(ctx, "pdftoppm", "-jpeg", "-r", "180", "-f", "1", "-l", strconv.Itoa(pageCount), path, prefix).CombinedOutput(); renderErr != nil {
 			cleanup()
 			return nil, nil, fmt.Errorf("render pdf: %v: %s", renderErr, output)
 		}
 		pages, _ := filepath.Glob(prefix + "-*.jpg")
-		if len(pages) == 0 {
+		if len(pages) != pageCount {
 			cleanup()
-			return nil, nil, fmt.Errorf("render pdf: no pages produced")
+			return nil, nil, fmt.Errorf("render pdf: expected %d pages, got %d", pageCount, len(pages))
 		}
 		images := make([]visionImage, 0, len(pages))
 		for _, page := range pages {

@@ -165,6 +165,9 @@ const (
 )
 
 type Analysis struct {
+	SourceStudyIndex      int                  `bson:"source_study_index,omitempty" json:"source_study_index,omitempty"`
+	SourceStudyCount      int                  `bson:"source_study_count,omitempty" json:"source_study_count,omitempty"`
+	RelatedAnalyses       []Analysis           `bson:"-" json:"related_analyses,omitempty"`
 	ID                    primitive.ObjectID   `bson:"_id,omitempty" json:"id"`
 	OwnerID               primitive.ObjectID   `bson:"owner_id" json:"owner_id"`
 	Title                 string               `bson:"title" json:"title"`
