@@ -45,6 +45,7 @@ func Connect(ctx context.Context, uri, database string) (*Mongo, error) {
 			{Keys: bson.D{{Key: "status", Value: 1}, {Key: "processing_next_attempt_at", Value: 1}, {Key: "created_at", Value: 1}}},
 		}},
 		{"usage_events", []mongo.IndexModel{{Keys: bson.D{{Key: "kind", Value: 1}, {Key: "created_at", Value: -1}}}}},
+		{"consent_events", []mongo.IndexModel{{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "created_at", Value: -1}}}}},
 		{"consultations", []mongo.IndexModel{
 			{Keys: bson.D{{Key: "patient_id", Value: 1}, {Key: "created_at", Value: -1}}},
 			{Keys: bson.D{{Key: "doctor_id", Value: 1}, {Key: "created_at", Value: -1}}},
@@ -380,6 +381,18 @@ func (s *Mongo) RecordUsageEvent(ctx context.Context, kind string, user domain.U
 	return err
 }
 
+func (s *Mongo) RecordConsentEvent(ctx context.Context, userID, analysisID primitive.ObjectID, action string) error {
+	_, err := s.db.Collection("consent_events").InsertOne(ctx, bson.M{
+		"kind":        "external_ai_document_processing",
+		"user_id":     userID,
+		"analysis_id": analysisID,
+		"action":      action,
+		"processor":   "DeepSeek",
+		"created_at":  time.Now().UTC(),
+	})
+	return err
+}
+
 func (s *Mongo) AppStats(ctx context.Context, since time.Time) (domain.AppStats, error) {
 	regularUser := bson.M{"$ne": true}
 	developerValues, err := s.db.Collection("users").Distinct(ctx, "_id", bson.M{"role": domain.RolePatient, "is_developer": true})
@@ -585,6 +598,9 @@ func (s *Mongo) CleanupScheduledAccountDeletions(ctx context.Context, uploadDir 
 			return paths, err
 		}
 		if _, err = s.db.Collection("usage_events").DeleteMany(ctx, bson.M{"user_id": user.ID}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("consent_events").DeleteMany(ctx, bson.M{"user_id": user.ID}); err != nil {
 			return paths, err
 		}
 		if _, err = s.db.Collection("analyses").DeleteMany(ctx, bson.M{"owner_id": user.ID}); err != nil {
@@ -941,11 +957,15 @@ func (s *Mongo) DeleteAIChat(ctx context.Context, id, doctor primitive.ObjectID)
 	return err
 }
 
-func (s *Mongo) ClinicalArticles(ctx context.Context, includeDrafts bool) ([]domain.ClinicalArticle, error) {
-	filter := bson.M{}
-	if !includeDrafts {
-		filter["published"] = true
+func articleVisibilityFilter(viewer primitive.ObjectID, includeOwnDrafts bool) bson.M {
+	if includeOwnDrafts {
+		return bson.M{"$or": []bson.M{{"published": true}, {"doctor_id": viewer}}}
 	}
+	return bson.M{"published": true}
+}
+
+func (s *Mongo) ClinicalArticles(ctx context.Context, viewer primitive.ObjectID, includeOwnDrafts bool) ([]domain.ClinicalArticle, error) {
+	filter := articleVisibilityFilter(viewer, includeOwnDrafts)
 	cur, err := s.db.Collection("clinical_articles").Find(ctx, filter, options.Find().SetSort(bson.D{{Key: "updated_at", Value: -1}}))
 	if err != nil {
 		return nil, err
@@ -956,11 +976,9 @@ func (s *Mongo) ClinicalArticles(ctx context.Context, includeDrafts bool) ([]dom
 	return out, err
 }
 
-func (s *Mongo) ClinicalArticle(ctx context.Context, id primitive.ObjectID, includeDrafts bool) (domain.ClinicalArticle, error) {
-	filter := bson.M{"_id": id}
-	if !includeDrafts {
-		filter["published"] = true
-	}
+func (s *Mongo) ClinicalArticle(ctx context.Context, id, viewer primitive.ObjectID, includeOwnDrafts bool) (domain.ClinicalArticle, error) {
+	filter := articleVisibilityFilter(viewer, includeOwnDrafts)
+	filter["_id"] = id
 	var out domain.ClinicalArticle
 	err := s.db.Collection("clinical_articles").FindOne(ctx, filter).Decode(&out)
 	return out, err
@@ -975,15 +993,15 @@ func (s *Mongo) SaveClinicalArticle(ctx context.Context, article *domain.Clinica
 		_, err := s.db.Collection("clinical_articles").InsertOne(ctx, article)
 		return err
 	}
-	r, err := s.db.Collection("clinical_articles").UpdateOne(ctx, bson.M{"_id": article.ID}, bson.M{"$set": bson.M{"doctor_id": article.DoctorID, "title": article.Title, "summary": article.Summary, "cover_url": article.CoverURL, "published": article.Published, "blocks": article.Blocks, "updated_at": now}})
+	r, err := s.db.Collection("clinical_articles").UpdateOne(ctx, bson.M{"_id": article.ID, "doctor_id": article.DoctorID}, bson.M{"$set": bson.M{"title": article.Title, "summary": article.Summary, "cover_url": article.CoverURL, "published": article.Published, "blocks": article.Blocks, "updated_at": now}})
 	if err == nil && r.MatchedCount == 0 {
 		return mongo.ErrNoDocuments
 	}
 	return err
 }
 
-func (s *Mongo) DeleteClinicalArticle(ctx context.Context, id primitive.ObjectID) error {
-	r, err := s.db.Collection("clinical_articles").DeleteOne(ctx, bson.M{"_id": id})
+func (s *Mongo) DeleteClinicalArticle(ctx context.Context, id, doctor primitive.ObjectID) error {
+	r, err := s.db.Collection("clinical_articles").DeleteOne(ctx, bson.M{"_id": id, "doctor_id": doctor})
 	if err == nil && r.DeletedCount == 0 {
 		return mongo.ErrNoDocuments
 	}

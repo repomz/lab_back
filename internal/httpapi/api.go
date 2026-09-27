@@ -740,6 +740,10 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+	if r.FormValue("aiProcessingConsent") != "true" {
+		write(w, 422, map[string]string{"error": "нужно согласие на передачу документа внешнему AI-сервису для распознавания"})
+		return
+	}
 	mime := header.Header.Get("Content-Type")
 	if !(strings.HasPrefix(mime, "image/") || mime == "application/pdf") {
 		write(w, 415, map[string]string{"error": "only image and PDF files are supported"})
@@ -772,6 +776,11 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 	if patientErr != nil {
 		_ = os.Remove(path)
 		write(w, 404, map[string]string{"error": "patient not found"})
+		return
+	}
+	if consentErr := a.store.RecordConsentEvent(r.Context(), u.ID, id, "upload"); consentErr != nil {
+		_ = os.Remove(path)
+		write(w, 500, map[string]string{"error": "не удалось сохранить согласие на обработку"})
 		return
 	}
 	startedAt := time.Now().UTC()
@@ -892,6 +901,13 @@ func (a *API) reprocess(w http.ResponseWriter, r *http.Request) {
 		write(w, 403, map[string]string{"error": "only patients can reprocess analyses"})
 		return
 	}
+	var consent struct {
+		AIProcessingConsent bool `json:"aiProcessingConsent"`
+	}
+	if decode(r, &consent) != nil || !consent.AIProcessingConsent {
+		write(w, 422, map[string]string{"error": "нужно согласие на повторную передачу документа внешнему AI-сервису"})
+		return
+	}
 	id, err := parseID(chi.URLParam(r, "id"))
 	if err != nil {
 		write(w, 400, map[string]string{"error": "invalid id"})
@@ -909,6 +925,10 @@ func (a *API) reprocess(w http.ResponseWriter, r *http.Request) {
 	patient, patientErr := a.store.UserByID(r.Context(), u.ID)
 	if patientErr != nil {
 		write(w, 404, map[string]string{"error": "patient not found"})
+		return
+	}
+	if consentErr := a.store.RecordConsentEvent(r.Context(), u.ID, id, "reprocess"); consentErr != nil {
+		write(w, 500, map[string]string{"error": "не удалось сохранить согласие на обработку"})
 		return
 	}
 	startedAt := time.Now().UTC()
@@ -1113,6 +1133,10 @@ func (a *API) createConsultation(w http.ResponseWriter, r *http.Request) {
 	}
 	if decode(r, &in) != nil {
 		write(w, 400, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if !in.PersonalDataConsent || !in.MedicalDataConsent {
+		write(w, 422, map[string]string{"error": "необходимо подтвердить оба согласия"})
 		return
 	}
 	did, e2 := parseID(in.DoctorID)
@@ -1579,7 +1603,8 @@ func (a *API) aiMessage(w http.ResponseWriter, r *http.Request) {
 	write(w, 201, assistant)
 }
 func (a *API) articleList(w http.ResponseWriter, r *http.Request) {
-	items, err := a.store.ClinicalArticles(r.Context(), current(r).Role == domain.RoleDoctor)
+	actor := current(r)
+	items, err := a.store.ClinicalArticles(r.Context(), actor.ID, actor.Role == domain.RoleDoctor)
 	if err != nil {
 		write(w, 500, map[string]string{"error": "could not load articles"})
 		return
@@ -1596,7 +1621,8 @@ func (a *API) articleDetail(w http.ResponseWriter, r *http.Request) {
 		write(w, 400, map[string]string{"error": "invalid article id"})
 		return
 	}
-	item, err := a.store.ClinicalArticle(r.Context(), id, current(r).Role == domain.RoleDoctor)
+	actor := current(r)
+	item, err := a.store.ClinicalArticle(r.Context(), id, actor.ID, actor.Role == domain.RoleDoctor)
 	if err != nil {
 		write(w, 404, map[string]string{"error": "article not found"})
 		return
@@ -1684,7 +1710,7 @@ func (a *API) deleteArticle(w http.ResponseWriter, r *http.Request) {
 		write(w, 400, map[string]string{"error": "invalid article id"})
 		return
 	}
-	if err = a.store.DeleteClinicalArticle(r.Context(), id); err != nil {
+	if err = a.store.DeleteClinicalArticle(r.Context(), id, current(r).ID); err != nil {
 		write(w, 404, map[string]string{"error": "article not found"})
 		return
 	}
