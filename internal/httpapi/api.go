@@ -701,6 +701,9 @@ func (a *API) analyses(w http.ResponseWriter, r *http.Request) {
 	if list == nil {
 		list = []domain.Analysis{}
 	}
+	for i := range list {
+		list[i] = analyzer.PresentAnalysis(list[i])
+	}
 	write(w, 200, list)
 }
 
@@ -835,7 +838,7 @@ func (a *API) analysis(w http.ResponseWriter, r *http.Request) {
 		write(w, 403, map[string]string{"error": "access denied"})
 		return
 	}
-	write(w, 200, item)
+	write(w, 200, analyzer.PresentAnalysis(item))
 }
 func (a *API) file(w http.ResponseWriter, r *http.Request) {
 	id, e := parseID(chi.URLParam(r, "id"))
@@ -1011,7 +1014,7 @@ func (a *API) confirmAnalysis(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	item.Markers, item.Report, item.AIReview, item.Status, item.ProcessingStage, item.ProcessingProgress = markers, report, review, domain.AnalysisStatusReady, domain.ProcessingStageCompleted, 100
-	write(w, 200, item)
+	write(w, 200, analyzer.PresentAnalysis(item))
 }
 func (a *API) share(w http.ResponseWriter, r *http.Request) {
 	u := current(r)

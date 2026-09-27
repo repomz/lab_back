@@ -160,64 +160,8 @@ func markersNeedStructuring(markers []domain.Marker) bool {
 }
 
 func ClassifyAnalysis(markers []domain.Marker, text string) string {
-	lower := strings.ToLower(text)
-	hasAny := func(words ...string) bool {
-		for _, word := range words {
-			if strings.Contains(lower, word) {
-				return true
-			}
-		}
-		return false
-	}
-	if hasAny("компьютерная томография", "кт органов", "кт-признак") {
-		if hasAny("грудной полост", "грудной клет", "легк") {
-			return "КТ · органы грудной клетки"
-		}
-		return "Компьютерная томография"
-	}
-	if hasAny("ультразвуковое исследование", "протокол ультразвукового", "эхоскопически") {
-		if hasAny("щитовидн") {
-			return "УЗИ · щитовидная железа"
-		}
-		if hasAny("почки", "почек", "почечн") {
-			return "УЗИ · почки"
-		}
-		return "Ультразвуковое исследование"
-	}
-	cbcMarkers, hormoneMarkers, urineMarkers := 0, 0, 0
-	for _, marker := range markers {
-		switch strings.ToLower(marker.CanonicalName) {
-		case "hemoglobin", "erythrocytes", "leukocytes", "platelets", "hematocrit", "mcv", "mch", "mchc", "esr":
-			cbcMarkers++
-		case "tsh", "free_t4", "free_t3", "cortisol", "prolactin", "testosterone", "estradiol", "insulin":
-			hormoneMarkers++
-		case "urine_protein", "urine_glucose", "urine_leukocytes", "urine_erythrocytes", "urine_ph", "specific_gravity":
-			urineMarkers++
-		}
-	}
-	if urineMarkers >= 2 || hasAny("общий анализ моч", "удельный вес", "плоский эпител", "лейкоциты в моч", "цвет моч", "микроальбумин") {
-		if hasAny("микроальбумин", "суточная моч", "белок в моч", "креатинин моч") {
-			return "Моча · биохимия"
-		}
-		return "Моча · ОАМ"
-	}
-	if cbcMarkers >= 2 || hasAny("гемоглобин", "эритроцит", "лейкоцит", "тромбоцит", "гематокрит", "соэ") {
-		return "Кровь · ОАК"
-	}
-	if hormoneMarkers >= 2 || hasAny("ттг", "тиреотроп", "т4 свобод", "т3 свобод", "кортизол", "пролактин", "тестостерон", "эстрадиол", "инсулин") {
-		return "Кровь · гормоны"
-	}
-	biochemistry := 0
-	for _, marker := range markers {
-		switch marker.CanonicalName {
-		case "glucose", "albumin", "bilirubin_total", "bilirubin_direct", "alt", "ast", "cholesterol_total", "triglycerides", "hdl", "ldl", "urea", "creatinine", "egfr", "crp", "uric_acid", "iron", "calcium_total", "potassium", "sodium":
-			biochemistry++
-		}
-	}
-	if biochemistry >= 2 || hasAny("биохимический анализ крови") {
-		return "Кровь · биохимия"
-	}
-	return "Лабораторное исследование"
+	_, category := CanonicalAnalysisIdentity(markers, text, nil)
+	return category
 }
 
 // ExtractStudyReport handles narrative diagnostic reports without asking a
@@ -344,14 +288,18 @@ func NormalizeConfirmedReport(report *domain.StudyReport) (*domain.StudyReport, 
 }
 
 func (s *Service) ReviewStudyReportForPatient(ctx context.Context, report *domain.StudyReport, profile *domain.PatientProfile) domain.AIReview {
-	summary := "Описание исследования сохранено. Формальное заключение в предоставленном фрагменте отсутствует; сверьте документ с оригиналом и обсудите его с лечащим врачом."
-	if strings.TrimSpace(report.Conclusion) != "" {
-		summary = "В заключении исследования указано: " + strings.TrimSpace(report.Conclusion)
+	fallback := studyRuleReview(report)
+	if s.cfg.DeepSeekAPIKey == "" {
+		return fallback
 	}
-	return domain.AIReview{
-		Summary: summary, Lifestyle: []string{}, Nutrition: []string{}, DoctorNeeded: true, Urgency: "routine",
-		Disclaimer: "Это пересказ подтверждённого текста исследования, а не диагноз. Интерпретировать результат должен лечащий врач с учётом симптомов и анамнеза.", Provider: "rules",
+	aiCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	review, err := s.deepSeekStudyReview(aiCtx, report, profile)
+	if err != nil {
+		log.Printf("deepseek study review failed: %v", err)
+		return fallback
 	}
+	return review
 }
 
 // ExtractCollectedAt prefers specimen collection / study dates and ignores
@@ -1285,14 +1233,110 @@ func ruleReview(markers []domain.Marker) domain.AIReview {
 			abnormal++
 		}
 	}
-	summary := "Показатели распознаны. Значимых отклонений по указанным лабораторией диапазонам не найдено."
-	need := false
-	urg := "routine"
-	if abnormal > 0 {
-		summary = fmt.Sprintf("Найдено показателей вне референсного диапазона: %d. Результат требует интерпретации с учётом симптомов и анамнеза.", abnormal)
-		need = true
+	review := domain.AIReview{
+		Summary:   "По указанным лабораторией диапазонам значимых отклонений не выявлено. Результат стоит оценивать вместе с самочувствием и предыдущими исследованиями.",
+		Lifestyle: []string{}, Nutrition: []string{}, Recommendations: []string{}, RedFlags: []string{},
+		DoctorNeeded: false, Urgency: "routine", Provider: "rules",
+		Disclaimer: "Автоматическая оценка не является диагнозом и не заменяет консультацию врача. При резком ухудшении самочувствия обратитесь за неотложной помощью.",
 	}
-	return domain.AIReview{Summary: summary, Lifestyle: []string{"Сохраняйте обычный режим сна и физической активности, если врач не рекомендовал иное."}, Nutrition: []string{"Не меняйте рацион радикально только на основании одного анализа."}, DoctorNeeded: need, Urgency: urg, Disclaimer: "Автоматическая оценка не является диагнозом и не заменяет консультацию врача. При резком ухудшении самочувствия обратитесь за неотложной помощью.", Provider: "rules"}
+	search := normalizedAnalysisText(markers, "", nil)
+	find := func(parts ...string) *domain.Marker {
+		for i := range markers {
+			name := normalizeSearch(markers[i].CanonicalName + " " + markers[i].Name)
+			if containsAny(name, parts...) {
+				return &markers[i]
+			}
+		}
+		return nil
+	}
+	findFlagged := func(parts ...string) *domain.Marker {
+		for i := range markers {
+			name := normalizeSearch(markers[i].CanonicalName + " " + markers[i].Name)
+			if containsAny(name, parts...) && (markers[i].Status == domain.StatusHigh || strings.Contains(markers[i].TextValue, "+")) {
+				return &markers[i]
+			}
+		}
+		return nil
+	}
+	if leucocytes := findFlagged("urine leukocytes", "лейкоциты"); strings.Contains(search, "моч") || find("бактерии", "нитриты", "относительная плотность") != nil {
+		if leucocytes != nil && (leucocytes.Status == domain.StatusHigh || strings.Contains(leucocytes.TextValue, "+")) {
+			review.Summary = "В моче выраженно представлены лейкоциты; вместе с бактериями или мутностью это может соответствовать воспалительным изменениям, но результат также зависит от правильности сбора образца. Отрицательные нитриты не исключают воспаление."
+			review.Recommendations = []string{"Обсудить результат с терапевтом или урологом в ближайшее время.", "При отсутствии срочных симптомов повторить общий анализ средней порции утренней мочи после правильного туалета; необходимость посева определит врач."}
+			review.RedFlags = []string{"Температура с болью в пояснице, озноб, видимая кровь в моче, задержка мочи или быстрое ухудшение самочувствия — повод для срочной очной помощи."}
+			review.DoctorNeeded, review.Urgency, review.SuggestedSpecialty = true, "soon", "Терапевт или уролог"
+			return review
+		}
+	}
+	tsh, freeT4 := find("tsh", "тиреотроп"), find("free t4", "тироксин свобод")
+	if tsh != nil && tsh.Status == domain.StatusHigh && freeT4 != nil && freeT4.Status == domain.StatusNormal {
+		review.Summary = "ТТГ немного выше референса при свободном Т4 в диапазоне лаборатории. Такое сочетание требует подтверждения в динамике и оценки симптомов, но само по себе не устанавливает заболевание щитовидной железы."
+		review.Recommendations = []string{"Планово обратиться к эндокринологу или терапевту.", "Обсудить повторный ТТГ и свободный Т4; врач при необходимости добавит антитела к ТПО и сопоставит результат с УЗИ и принимаемыми препаратами."}
+		review.DoctorNeeded, review.Urgency, review.SuggestedSpecialty = true, "routine", "Эндокринолог"
+		return review
+	}
+	lymphocytes, neutrophils, wbc, esr := find("lymphocyte", "лимфоцит", "lym percent"), find("neutrophil", "нейтрофил", "gran percent"), find("wbc"), find("esr", "соэ")
+	if lymphocytes != nil && lymphocytes.Status == domain.StatusHigh && neutrophils != nil && neutrophils.Status == domain.StatusLow {
+		wbcContext := ""
+		if wbc != nil && wbc.Status == domain.StatusNormal {
+			wbcContext = " при нормальном общем числе лейкоцитов"
+		}
+		review.Summary = "В лейкоцитарной формуле повышена доля лимфоцитов и снижена доля нейтрофилов" + wbcContext + ". Это преимущественно относительное изменение; повышенная СОЭ, если она есть, является неспецифическим признаком и оценивается вместе с жалобами."
+		review.Recommendations = []string{"Сопоставить результат с недавними инфекциями, симптомами и лекарствами на приёме у терапевта.", "Если самочувствие стабильное, врач может рекомендовать повторный общий анализ крови с абсолютными значениями лейкоцитарной формулы в динамике."}
+		if esr != nil && esr.Status == domain.StatusHigh {
+			review.DoctorNeeded = true
+		}
+		review.Urgency, review.SuggestedSpecialty = "routine", "Терапевт"
+		return review
+	}
+	glucose := find("glucose", "глюкоза")
+	if glucose != nil && glucose.Status == domain.StatusHigh {
+		review.Summary = "Глюкоза немного выше диапазона этого бланка, тогда как остальные представленные показатели функции почек, воспаления и липидного обмена без отмеченных отклонений. Значимость результата зависит от того, сдавалась ли кровь натощак."
+		review.Recommendations = []string{"Уточнить у врача условия сдачи; при анализе не натощак небольшое повышение может быть непоказательным.", "Обсудить контроль глюкозы натощак и, при наличии факторов риска, HbA1c."}
+		review.DoctorNeeded, review.Urgency, review.SuggestedSpecialty = true, "routine", "Терапевт"
+		return review
+	}
+	if abnormal > 0 {
+		review.Summary = fmt.Sprintf("В бланке отмечено показателей вне лабораторного диапазона: %d. Важны не только отдельные флаги, но и их сочетание, выраженность, симптомы и изменение во времени.", abnormal)
+		review.Recommendations = []string{"Обсудить отклонения с терапевтом и сопоставить их с жалобами и предыдущими результатами.", "Не менять лечение и питание только по автоматической оценке одного бланка."}
+		review.DoctorNeeded = true
+		review.SuggestedSpecialty = "Терапевт"
+	}
+	return review
+}
+
+func studyRuleReview(report *domain.StudyReport) domain.AIReview {
+	review := domain.AIReview{Lifestyle: []string{}, Nutrition: []string{}, Recommendations: []string{}, RedFlags: []string{}, DoctorNeeded: true, Urgency: "routine", Provider: "rules", Disclaimer: "Автоматическая оценка помогает понять текст исследования, но не является диагнозом и не заменяет консультацию врача с учётом симптомов и анамнеза."}
+	if report == nil {
+		review.Summary = "Данные исследования отсутствуют."
+		return review
+	}
+	text := normalizeSearch(strings.Join([]string{report.StudyName, report.Description, report.Conclusion}, " "))
+	switch {
+	case containsAny(text, "пневмофиброз", "тэла", "легочная гипертензия", "лаг"):
+		review.Summary = "КТ фиксирует хронические изменения лёгких и признаки ранее перенесённой тромбоэмболии с лёгочной гипертензией. Это требует сопоставления с одышкой, сатурацией, сердечно‑сосудистым анамнезом и предыдущими снимками."
+		if containsAny(text, "инфильтративных изменений в легких не выявлено", "инфильтративные изменения не выявлены") {
+			review.Summary = "КТ не описывает свежих инфильтративных изменений, но фиксирует хронические изменения лёгких и признаки ранее перенесённой тромбоэмболии с лёгочной гипертензией. Это требует сопоставления с одышкой, сатурацией, сердечно‑сосудистым анамнезом и предыдущими снимками."
+		}
+		review.Recommendations = []string{"В ближайшее время показать заключение пульмонологу или кардиологу и взять предыдущие исследования для сравнения.", "Обсудить с врачом необходимость оценки сатурации, ЭКГ/эхокардиографии и контроля причин лёгочной гипертензии."}
+		review.RedFlags = []string{"Внезапная одышка, боль в груди, кровохарканье, обморок или резкое снижение сатурации требуют экстренной помощи."}
+		review.Urgency, review.SuggestedSpecialty = "soon", "Пульмонолог или кардиолог"
+	case containsAny(text, "щитовидн") && containsAny(text, "узел", "узлы"):
+		review.Summary = "На УЗИ описаны узловые образования щитовидной железы. По одному тексту без формального заключения и категории риска нельзя определить их значимость; важны размеры, ультразвуковые признаки и сравнение в динамике."
+		review.Recommendations = []string{"Планово показать полный протокол эндокринологу.", "Попросить врача или специалиста УЗИ указать категорию риска (например, TI‑RADS) и определить сроки контроля; вопрос пункции решается только по совокупности признаков и размеров."}
+		review.SuggestedSpecialty = "Эндокринолог"
+	case containsAny(text, "почки", "почек") && containsAny(text, "без выраженной патологии", "конкременты не", "полостные структуры не расширены"):
+		review.Summary = "Заключение УЗИ почек не указывает на выраженную структурную патологию. УЗИ не оценивает функцию почек, поэтому при жалобах его сопоставляют с анализами крови и мочи."
+		review.Recommendations = []string{"При отсутствии жалоб достаточно планового наблюдения.", "При боли, отёках, изменениях мочи или давления обсудить с терапевтом анализ мочи, креатинин и расчётную СКФ."}
+		review.DoctorNeeded = false
+	default:
+		if strings.TrimSpace(report.Conclusion) != "" {
+			review.Summary = "Исследование содержит формальное заключение: " + strings.TrimSpace(report.Conclusion) + ". Его значение определяется вместе с описанием, симптомами и предыдущими исследованиями."
+		} else {
+			review.Summary = "Описание исследования распознано, но на предоставленном фрагменте нет формального заключения. Это не означает нормальный результат: полный протокол следует показать врачу для интерпретации."
+		}
+		review.Recommendations = []string{"Сверить распознанный текст с оригиналом и обсудить полный протокол с лечащим врачом."}
+	}
+	return review
 }
 
 func emptyReview() domain.AIReview {
@@ -1363,7 +1407,7 @@ func (s *Service) deepSeekReview(ctx context.Context, markers []domain.Marker, p
 	var out struct {
 		AIReview domain.AIReview `json:"ai_review"`
 	}
-	system := "Ты медицинский модуль краткого резюме лабораторных результатов. Верни только JSON {ai_review:{summary,lifestyle:[],nutrition:[],doctor_needed,urgency,suggested_specialty}}. Summary: 2–4 понятных предложения только о содержании анализа и отклонениях, без диагноза и назначения препаратов. Называй показатель нормальным или отклонённым исключительно по переданному status; status=unknown означает, что на бланке нет референса, и такой показатель нельзя объявлять нормальным. Не объясняй возможные заболевания или причины отклонений. Учитывай возраст и ИМТ только как явно обозначенный контекст. Если есть значимые отклонения, укажи подходящую специальность врача. urgency — строго routine, soon или urgent. Не повторяй всю таблицу и не выдумывай данные."
+	system := "Ты формируешь клинически полезное, но безопасное резюме лабораторного бланка для пациента. Верни только JSON {ai_review:{summary,lifestyle:[],nutrition:[],recommendations:[],red_flags:[],doctor_needed,urgency,suggested_specialty}}. Не перечисляй строки таблицы подряд. Сначала объедини показатели в общую картину: характер сочетания отклонений, их выраженность и что в этом бланке выглядит успокаивающе. Затем укажи, что практически делать дальше и к какому врачу обратиться. Допустимо осторожно назвать возможную интерпретацию сочетания словами «может соответствовать» или «требует исключить», но нельзя ставить диагноз, назначать лекарства, дозировки или отменять лечение. Оценивай normal/high/low только по переданному status. status=unknown означает отсутствие напечатанного референса: не называй такой показатель нормальным и не подставляй типовую норму. Учитывай условия сдачи и недостающие абсолютные значения. recommendations — 1–3 конкретных следующих шага; red_flags — только действительно уместные симптомы для срочной помощи, иначе пустой массив. lifestyle и nutrition заполняй только если совет прямо следует из данных, без общих шаблонов. urgency — строго routine, soon или urgent. Не выдумывай факты."
 	if err = s.completeJSON(ctx, system, profileContext+"\nПоказатели: "+string(markerJSON), &out); err != nil {
 		return domain.AIReview{}, err
 	}
@@ -1382,6 +1426,56 @@ func (s *Service) deepSeekReview(ctx context.Context, markers []domain.Marker, p
 	}
 	if out.AIReview.Nutrition == nil {
 		out.AIReview.Nutrition = []string{}
+	}
+	if out.AIReview.Recommendations == nil {
+		out.AIReview.Recommendations = []string{}
+	}
+	if out.AIReview.RedFlags == nil {
+		out.AIReview.RedFlags = []string{}
+	}
+	return out.AIReview, nil
+}
+
+func (s *Service) deepSeekStudyReview(ctx context.Context, report *domain.StudyReport, profile *domain.PatientProfile) (domain.AIReview, error) {
+	profileContext := "Профиль пользователя не заполнен."
+	if profile != nil {
+		profileContext = fmt.Sprintf("Возраст %d лет, ИМТ %.1f.", profile.Age, profile.BMI)
+	}
+	input, err := json.Marshal(map[string]any{
+		"modality": report.Modality, "study_name": report.StudyName,
+		"description": report.Description, "conclusion": report.Conclusion,
+	})
+	if err != nil {
+		return domain.AIReview{}, err
+	}
+	var out struct {
+		AIReview domain.AIReview `json:"ai_review"`
+	}
+	system := "Ты формируешь понятное пациенту медицинское резюме подтверждённого протокола УЗИ/КТ/МРТ/рентгена. Верни только JSON {ai_review:{summary,lifestyle:[],nutrition:[],recommendations:[],red_flags:[],doctor_needed,urgency,suggested_specialty}}. Не копируй заключение как единственное резюме. Объясни общую значимость находок простыми словами, отдели успокаивающие признаки от тех, которые требуют наблюдения, и предложи 1–3 конкретных следующих шага. Если формального заключения нет, всё равно оцени видимые факты из description, но прямо укажи ограничение. Не добавляй отсутствующие признаки, не ставь новый диагноз, не назначай лекарства или дозировки. Осторожные формулировки «может соответствовать» допустимы только как интерпретация явно описанного сочетания. red_flags заполняй только уместными симптомами для срочной помощи. lifestyle и nutrition — только когда они прямо следуют из протокола. urgency строго routine, soon или urgent."
+	if err = s.completeJSON(ctx, system, profileContext+"\nПодтверждённый протокол: "+string(input), &out); err != nil {
+		return domain.AIReview{}, err
+	}
+	if strings.TrimSpace(out.AIReview.Summary) == "" {
+		return domain.AIReview{}, fmt.Errorf("deepseek returned empty study review")
+	}
+	out.AIReview.Provider = "deepseek"
+	out.AIReview.Disclaimer = studyRuleReview(report).Disclaimer
+	if out.AIReview.Lifestyle == nil {
+		out.AIReview.Lifestyle = []string{}
+	}
+	if out.AIReview.Nutrition == nil {
+		out.AIReview.Nutrition = []string{}
+	}
+	if out.AIReview.Recommendations == nil {
+		out.AIReview.Recommendations = []string{}
+	}
+	if out.AIReview.RedFlags == nil {
+		out.AIReview.RedFlags = []string{}
+	}
+	switch out.AIReview.Urgency {
+	case "routine", "soon", "urgent":
+	default:
+		out.AIReview.Urgency = "routine"
 	}
 	return out.AIReview, nil
 }
@@ -1408,6 +1502,9 @@ type PatientHealthSummaryResult struct {
 
 func (s *Service) PatientHealthSummary(ctx context.Context, patient domain.User, analyses []domain.Analysis) PatientHealthSummaryResult {
 	analyses = completedAnalyses(analyses)
+	for i := range analyses {
+		analyses[i] = PresentAnalysis(analyses[i])
+	}
 	if len(analyses) == 0 {
 		return PatientHealthSummaryResult{Summary: "После загрузки и распознавания анализов здесь появится общее резюме вашего текущего состояния и динамики показателей."}
 	}
@@ -1425,7 +1522,7 @@ func (s *Service) PatientHealthSummary(ctx context.Context, patient domain.User,
 	}
 	profileJSON, _ := json.Marshal(patient.PatientProfile)
 	var out PatientHealthSummaryResult
-	system := "Ты формируешь одно общее безопасное резюме состояния пациента по всей доступной истории лабораторных исследований. Не перечисляй отдельные резюме анализов подряд. Сначала кратко опиши общую картину, затем оцени динамику только тех показателей, которые действительно измерялись неоднократно. Учитывай даты и разные референсные диапазоны, не ставь диагноз, не назначай препараты и не выдумывай отсутствующие данные. При значимых отклонениях укажи, к какому врачу разумно обратиться. Ответ на русском, понятный пациенту, 5–9 предложений. Верни JSON {summary}."
+	system := "Ты формируешь одно общее безопасное резюме состояния пациента по всей доступной истории лабораторных анализов и инструментальных исследований. Не перечисляй документы подряд. Сначала объедини находки в клинически понятную общую картину, затем выдели приоритеты и оцени динамику только тех показателей, которые действительно измерялись неоднократно. Учитывай даты, разные лабораторные референсы и формальные заключения исследований. Отделяй подтверждённые факты от осторожной интерпретации, не ставь новый диагноз, не назначай препараты и не выдумывай отсутствующие данные. Заверши 2–4 конкретными следующими шагами и укажи, к какому врачу разумно обратиться. Ответ на русском, понятный пациенту, 6–10 предложений. Верни JSON {summary}."
 	err := s.completeJSON(ctx, system, "Профиль: "+string(profileJSON)+"\nИстория анализов:\n"+compactAnalysisContext(analyses), &out)
 	if err != nil || strings.TrimSpace(out.Summary) == "" {
 		return PatientHealthSummaryResult{Summary: fallback}
@@ -1513,11 +1610,20 @@ func compactAnalysisContext(analyses []domain.Analysis) string {
 	if len(analyses) == 0 {
 		return "нет данных"
 	}
-	if len(analyses) > 3 {
-		analyses = analyses[:3]
+	if len(analyses) > 6 {
+		analyses = analyses[:6]
 	}
 	var lines []string
 	for _, analysis := range analyses {
+		analysis = PresentAnalysis(analysis)
+		when := analysis.CreatedAt
+		if analysis.CollectedAt != nil {
+			when = *analysis.CollectedAt
+		}
+		if analysis.Report != nil {
+			lines = append(lines, when.Format("02.01.2006")+" "+analysis.Title+": описание="+trimRunes(analysis.Report.Description, 1500)+"; заключение="+trimRunes(analysis.Report.Conclusion, 600))
+			continue
+		}
 		var markers []string
 		for _, marker := range analysis.Markers {
 			if marker.Status != domain.StatusNormal || len(markers) < 6 {
@@ -1528,7 +1634,7 @@ func compactAnalysisContext(analyses []domain.Analysis) string {
 				markers = append(markers, fmt.Sprintf("%s=%s %s (%s)", marker.Name, value, marker.Unit, marker.Status))
 			}
 		}
-		lines = append(lines, analysis.CreatedAt.Format("02.01.2006")+" "+analysis.Title+": "+strings.Join(markers, ", "))
+		lines = append(lines, when.Format("02.01.2006")+" "+analysis.Title+": "+strings.Join(markers, ", "))
 	}
 	return strings.Join(lines, "\n")
 }

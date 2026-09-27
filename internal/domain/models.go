@@ -121,6 +121,8 @@ type AIReview struct {
 	Summary            string   `bson:"summary" json:"summary"`
 	Lifestyle          []string `bson:"lifestyle" json:"lifestyle"`
 	Nutrition          []string `bson:"nutrition" json:"nutrition"`
+	Recommendations    []string `bson:"recommendations,omitempty" json:"recommendations,omitempty"`
+	RedFlags           []string `bson:"red_flags,omitempty" json:"red_flags,omitempty"`
 	DoctorNeeded       bool     `bson:"doctor_needed" json:"doctor_needed"`
 	Urgency            string   `bson:"urgency" json:"urgency"`
 	SuggestedSpecialty string   `bson:"suggested_specialty,omitempty" json:"suggested_specialty,omitempty"`

@@ -156,6 +156,7 @@ const visionExtractionPrompt = `Прочитай все приложенные �
 6. Для УЗИ, КТ, МРТ или рентгена дословно перепиши медицинское описание в report.description и формальное заключение в report.conclusion. Не превращай описание в собственный диагноз. Для лабораторного документа report=null.
 7. medical_text должен содержать аккуратную транскрипцию только медицинской части документа без ФИО, адреса, полиса, номера карты и иных идентификаторов пациента.
 8. collected_at — дата забора материала или дата исследования в YYYY-MM-DD; не дата рождения, печати или направления. Если её нет, пустая строка.
+9. title — короткое понятное название вида исследования, без перечисления всех строк бланка. category не является свободным текстом: выбери одну рубрику из «Кровь», «Моча», «УЗИ», «КТ и МРТ», «Рентген», «Другие анализы».
 Верни JSON строго такой формы:
 {"document_type":"laboratory|diagnostic","title":"краткое название исследования","category":"категория","collected_at":"YYYY-MM-DD или пусто","medical_text":"транскрипция медицинской части","markers":[{"name":"как на бланке","canonical_name":"стабильное английское имя или транслитерация","value":null,"text_value":"","unit":"","reference_min":null,"reference_max":null,"reference_text":"","status":"low|normal|high|unknown"}],"report":null}
 Для диагностического исследования markers=[] и report={"modality":"УЗИ|КТ|МРТ|Рентген","study_name":"название","description":"дословное описание","conclusion":"дословное заключение","confidence":1,"warnings":[]}.`
@@ -202,16 +203,9 @@ func (s *Service) finishVisionExtraction(ctx context.Context, extracted visionEx
 	} else {
 		return DocumentResult{}, fmt.Errorf("visual recognition found neither laboratory values nor a diagnostic report")
 	}
-	if result.Title == "" {
-		if result.Report != nil {
-			result.Title = result.Report.StudyName
-		} else {
-			result.Title = ClassifyAnalysis(result.Markers, result.MedicalText)
-		}
-	}
-	if result.Category == "" {
-		result.Category = ClassifyAnalysis(result.Markers, result.MedicalText)
-	}
+	// Provider labels are suggestions only. One deterministic taxonomy keeps
+	// new and historical documents in the same patient-facing rubric.
+	result.Title, result.Category = CanonicalAnalysisIdentity(result.Markers, result.MedicalText, result.Report)
 	return result, nil
 }
 

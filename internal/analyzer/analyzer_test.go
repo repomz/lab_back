@@ -408,14 +408,69 @@ func TestOCRPhotoFixture(t *testing.T) {
 
 func TestClassifyAnalysisFromRecognizedMarkers(t *testing.T) {
 	biochemistry := []domain.Marker{{CanonicalName: "glucose"}, {CanonicalName: "creatinine"}, {CanonicalName: "alt"}}
-	if got := ClassifyAnalysis(biochemistry, "Сыворотка крови"); got != "Кровь · биохимия" {
+	if got := ClassifyAnalysis(biochemistry, "Сыворотка крови"); got != "Кровь" {
 		t.Fatalf("biochemistry classified as %q", got)
 	}
 	cbc := []domain.Marker{{CanonicalName: "hemoglobin"}, {CanonicalName: "leukocytes"}, {CanonicalName: "platelets"}}
-	if got := ClassifyAnalysis(cbc, "Общий анализ крови"); got != "Кровь · ОАК" {
+	if got := ClassifyAnalysis(cbc, "Общий анализ крови"); got != "Кровь" {
 		t.Fatalf("CBC classified as %q", got)
 	}
-	if got := ClassifyAnalysis(nil, "Общий анализ мочи лейкоциты эритроциты удельный вес"); got != "Моча · ОАМ" {
+	if got := ClassifyAnalysis(nil, "Общий анализ мочи лейкоциты эритроциты удельный вес"); got != "Моча" {
 		t.Fatalf("urinalysis classified as %q", got)
+	}
+}
+
+func TestCanonicalIdentityKeepsMixedBloodAndUrineDocumentReadable(t *testing.T) {
+	markers := []domain.Marker{
+		{Name: "WBC", CanonicalName: "WBC"},
+		{Name: "RBC", CanonicalName: "RBC"},
+		{Name: "PLT", CanonicalName: "PLT"},
+		{Name: "Микроальбумин", CanonicalName: "Microalbumin"},
+	}
+	title, category := CanonicalAnalysisIdentity(markers, "Общий анализ крови развернутый. Исследование на микроальбуминурию", nil)
+	if title != "Общий анализ крови и микроальбумин мочи" || category != "Кровь" {
+		t.Fatalf("unexpected identity: %q / %q", title, category)
+	}
+}
+
+func TestCanonicalIdentityRecognizesLegacyUrinalysisNames(t *testing.T) {
+	markers := []domain.Marker{
+		{Name: "Лейкоциты", CanonicalName: "leukocytes"},
+		{Name: "Эритроциты", CanonicalName: "erythrocytes"},
+		{Name: "Относительная плотность", CanonicalName: "relative_density"},
+	}
+	title, category := CanonicalAnalysisIdentity(markers, "Микроскопическое исследование осадка мочи\nОбщий анализ мочи", nil)
+	if title != "Общий анализ мочи" || category != "Моча" {
+		t.Fatalf("urinalysis identity: %q / %q", title, category)
+	}
+}
+
+func TestRuleReviewSynthesizesThyroidPattern(t *testing.T) {
+	markers := []domain.Marker{
+		{Name: "Тиреотропный гормон", CanonicalName: "thyroid_stimulating_hormone_tsh", Status: domain.StatusHigh},
+		{Name: "Тироксин свободный", CanonicalName: "free_thyroxine_t4", Status: domain.StatusNormal},
+	}
+	review := ruleReview(markers)
+	if !strings.Contains(review.Summary, "ТТГ") || review.SuggestedSpecialty != "Эндокринолог" || len(review.Recommendations) < 2 {
+		t.Fatalf("weak thyroid synthesis: %#v", review)
+	}
+}
+
+func TestStudyRuleReviewExplainsCTAndNextSteps(t *testing.T) {
+	review := studyRuleReview(&domain.StudyReport{Modality: "КТ", StudyName: "КТ органов грудной клетки", Conclusion: "КТ-признаки пневмофиброза, перенесенной ТЭЛА справа, ЛАГ"})
+	if review.Urgency != "soon" || len(review.Recommendations) == 0 || len(review.RedFlags) == 0 || strings.HasPrefix(review.Summary, "В заключении") {
+		t.Fatalf("weak CT synthesis: %#v", review)
+	}
+}
+
+func TestRuleReviewUsesStrongestDuplicateUrineLeukocyteResult(t *testing.T) {
+	markers := []domain.Marker{
+		{Name: "Бактерии", CanonicalName: "bacteria", TextValue: "+", Status: domain.StatusUnknown},
+		{Name: "Лейкоциты", CanonicalName: "leukocytes", TextValue: "6-8", Status: domain.StatusUnknown},
+		{Name: "Лейкоциты", CanonicalName: "leukocytes", TextValue: "++++", Status: domain.StatusUnknown},
+	}
+	review := ruleReview(markers)
+	if review.Urgency != "soon" || review.SuggestedSpecialty != "Терапевт или уролог" || len(review.RedFlags) == 0 {
+		t.Fatalf("weak urinalysis synthesis: %#v", review)
 	}
 }
