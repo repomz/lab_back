@@ -45,25 +45,25 @@ func CanonicalAnalysisIdentity(markers []domain.Marker, medicalText string, repo
 	}
 
 	counts := markerFamilies(markers)
-	if counts["thyroid"] >= 2 || has("тиреотропный", "ттг", "т3 свобод", "т4 свобод") {
+	if counts["thyroid"] >= 1 || has("тиреотропный", "ттг", "т3 свобод", "т4 свобод") {
 		return "Гормоны щитовидной железы", "Кровь"
 	}
 	if has("общий анализ мочи", "осадка мочи", "относительная плотность") {
 		return "Общий анализ мочи", "Моча"
 	}
-	if counts["cbc"] >= 2 || has("общий анализ крови", "лейкоцитарная формула", "соэ по панченкову") {
+	if counts["cbc"] >= 1 || has("общий анализ крови", "лейкоцитарная формула", "соэ по панченкову") {
 		if counts["urine"] > 0 || has("микроальбумин") {
 			return "Общий анализ крови и микроальбумин мочи", "Кровь"
 		}
 		return "Общий анализ крови", "Кровь"
 	}
-	if counts["urine"] >= 2 || has("общий анализ мочи", "осадка мочи", "относительная плотность", "бактерии слизь") {
+	if counts["urine"] >= 1 || has("общий анализ мочи", "осадка мочи", "относительная плотность", "бактерии слизь") {
 		if has("микроальбумин", "суточная моча", "креатинин мочи") {
 			return "Биохимия мочи", "Моча"
 		}
 		return "Общий анализ мочи", "Моча"
 	}
-	if counts["biochemistry"] >= 2 || has("биохимический анализ крови") {
+	if counts["biochemistry"] >= 1 || has("биохимический анализ крови") {
 		return "Биохимия крови", "Кровь"
 	}
 	return "Лабораторное исследование", "Другие анализы"
@@ -125,10 +125,10 @@ func markerFamilies(markers []domain.Marker) map[string]int {
 		switch {
 		case containsAny(key, "tsh", "thyroid stimulating", "тиреотроп", "free t3", "free t4", "трийодтиронин", "тироксин"):
 			family = "thyroid"
-		case containsAny(key, "wbc", "rbc", "hgb", "hct", "plt", "hemoglobin", "лейкоцит", "эритроцит", "гемоглобин", "гематокрит", "тромбоцит", "нейтрофил", "лимфоцит", "эозинофил", "моноцит", "gran percent", "lym percent", "соэ", "esr"):
-			family = "cbc"
 		case containsAny(key, "urine", "microalbumin", "микроальбумин", "нитрит", "кетон", "уробилиноген", "относительная плотность", "бактерии", "слизь", "эпителий", "прозрачность", "цвет"):
 			family = "urine"
+		case containsAny(key, "wbc", "rbc", "hgb", "hct", "plt", "hemoglobin", "лейкоцит", "эритроцит", "гемоглобин", "гематокрит", "тромбоцит", "нейтрофил", "лимфоцит", "эозинофил", "моноцит", "gran percent", "lym percent", "соэ", "esr"):
+			family = "cbc"
 		case containsAny(key, "glucose", "creatinine", "urea", "cholesterol", "bilirubin", "albumin", "alt", "ast", "egfr", "gfr", "crp", "c reactive", "глюкоза", "креатинин", "мочевина", "холестерин", "билирубин", "альбумин", "кальций", "calcium", "железо", "iron"):
 			family = "biochemistry"
 		}

@@ -445,6 +445,24 @@ func TestCanonicalIdentityRecognizesLegacyUrinalysisNames(t *testing.T) {
 	}
 }
 
+func TestCanonicalIdentityClassifiesSingleSpecificMarker(t *testing.T) {
+	cases := []struct {
+		marker   domain.Marker
+		title    string
+		category string
+	}{
+		{domain.Marker{Name: "Глюкоза", CanonicalName: "glucose"}, "Биохимия крови", "Кровь"},
+		{domain.Marker{Name: "Лейкоциты", CanonicalName: "urine_leukocytes"}, "Общий анализ мочи", "Моча"},
+		{domain.Marker{Name: "ТТГ", CanonicalName: "tsh"}, "Гормоны щитовидной железы", "Кровь"},
+	}
+	for _, test := range cases {
+		title, category := CanonicalAnalysisIdentity([]domain.Marker{test.marker}, "", nil)
+		if title != test.title || category != test.category {
+			t.Errorf("%s classified as %q / %q", test.marker.CanonicalName, title, category)
+		}
+	}
+}
+
 func TestRuleReviewSynthesizesThyroidPattern(t *testing.T) {
 	markers := []domain.Marker{
 		{Name: "Тиреотропный гормон", CanonicalName: "thyroid_stimulating_hormone_tsh", Status: domain.StatusHigh},
