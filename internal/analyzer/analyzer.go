@@ -1500,13 +1500,13 @@ type PatientHealthSummaryResult struct {
 	Summary string `json:"summary"`
 }
 
-func (s *Service) PatientHealthSummary(ctx context.Context, patient domain.User, analyses []domain.Analysis) PatientHealthSummaryResult {
+func (s *Service) PatientHealthSummary(ctx context.Context, patient domain.User, analyses []domain.Analysis) (PatientHealthSummaryResult, error) {
 	analyses = completedAnalyses(analyses)
 	for i := range analyses {
 		analyses[i] = PresentAnalysis(analyses[i])
 	}
 	if len(analyses) == 0 {
-		return PatientHealthSummaryResult{Summary: "После загрузки и распознавания анализов здесь появится общее резюме вашего текущего состояния и динамики показателей."}
+		return PatientHealthSummaryResult{Summary: "После загрузки и распознавания анализов здесь появится общее резюме вашего текущего состояния и динамики показателей."}, nil
 	}
 	fallback := "По доступным исследованиям сформировано общее резюме. "
 	if text := strings.TrimSpace(analyses[0].AIReview.Summary); text != "" {
@@ -1518,16 +1518,19 @@ func (s *Service) PatientHealthSummary(ctx context.Context, patient domain.User,
 		fallback += " В истории есть несколько исследований; повторяющиеся показатели следует оценивать в динамике по датам и референсным диапазонам лабораторий."
 	}
 	if s.cfg.DeepSeekAPIKey == "" {
-		return PatientHealthSummaryResult{Summary: fallback}
+		return PatientHealthSummaryResult{Summary: fallback}, fmt.Errorf("AI service is not configured")
 	}
 	profileJSON, _ := json.Marshal(patient.PatientProfile)
 	var out PatientHealthSummaryResult
 	system := "Ты формируешь одно общее безопасное резюме состояния пациента по всей доступной истории лабораторных анализов и инструментальных исследований. Не перечисляй документы подряд. Сначала объедини находки в клинически понятную общую картину, затем выдели приоритеты и оцени динамику только тех показателей, которые действительно измерялись неоднократно. Учитывай даты, разные лабораторные референсы и формальные заключения исследований. Отделяй подтверждённые факты от осторожной интерпретации, не ставь новый диагноз, не назначай препараты и не выдумывай отсутствующие данные. Заверши 2–4 конкретными следующими шагами и укажи, к какому врачу разумно обратиться. Ответ на русском, понятный пациенту, 6–10 предложений. Верни JSON {summary}."
 	err := s.completeJSON(ctx, system, "Профиль: "+string(profileJSON)+"\nИстория анализов:\n"+compactAnalysisContext(analyses), &out)
 	if err != nil || strings.TrimSpace(out.Summary) == "" {
-		return PatientHealthSummaryResult{Summary: fallback}
+		if err == nil {
+			err = fmt.Errorf("empty AI summary")
+		}
+		return PatientHealthSummaryResult{Summary: fallback}, err
 	}
-	return out
+	return out, nil
 }
 
 func (s *Service) Recommendation(ctx context.Context, kind string, profile domain.PatientProfile, analyses []domain.Analysis) (string, error) {

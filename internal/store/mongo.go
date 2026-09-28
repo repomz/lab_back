@@ -46,6 +46,7 @@ func Connect(ctx context.Context, uri, database string) (*Mongo, error) {
 		}},
 		{"usage_events", []mongo.IndexModel{{Keys: bson.D{{Key: "kind", Value: 1}, {Key: "created_at", Value: -1}}}}},
 		{"consent_events", []mongo.IndexModel{{Keys: bson.D{{Key: "user_id", Value: 1}, {Key: "created_at", Value: -1}}}}},
+		{"health_summaries", []mongo.IndexModel{{Keys: bson.D{{Key: "owner_id", Value: 1}}}}},
 		{"consultations", []mongo.IndexModel{
 			{Keys: bson.D{{Key: "patient_id", Value: 1}, {Key: "created_at", Value: -1}}},
 			{Keys: bson.D{{Key: "doctor_id", Value: 1}, {Key: "created_at", Value: -1}}},
@@ -604,6 +605,9 @@ func (s *Mongo) CleanupScheduledAccountDeletions(ctx context.Context, uploadDir 
 			return paths, err
 		}
 		if _, err = s.db.Collection("consent_events").DeleteMany(ctx, bson.M{"user_id": user.ID}); err != nil {
+			return paths, err
+		}
+		if _, err = s.db.Collection("health_summaries").DeleteMany(ctx, bson.M{"owner_id": user.ID}); err != nil {
 			return paths, err
 		}
 		if _, err = s.db.Collection("analyses").DeleteMany(ctx, bson.M{"owner_id": user.ID}); err != nil {

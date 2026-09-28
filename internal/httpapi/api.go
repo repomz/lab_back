@@ -22,13 +22,15 @@ import (
 	"github.com/repomz/lab_back/internal/store"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
+	"golang.org/x/sync/singleflight"
 )
 
 type API struct {
-	cfg       config.Config
-	store     *store.Mongo
-	analyzer  *analyzer.Service
-	aiLimiter *aiUserLimiter
+	cfg             config.Config
+	store           *store.Mongo
+	analyzer        *analyzer.Service
+	aiLimiter       *aiUserLimiter
+	healthSummaries singleflight.Group
 }
 type actor struct {
 	ID   primitive.ObjectID
@@ -71,7 +73,7 @@ func New(cfg config.Config, s *store.Mongo, a *analyzer.Service) http.Handler {
 		r.Get("/api/v1/admin/stats", api.appStats)
 		r.Post("/api/v1/admin/impersonate", api.adminImpersonate)
 		r.Get("/api/v1/analyses", api.analyses)
-		r.With(api.limitAIRequests).Get("/api/v1/me/health-summary", api.healthSummary)
+		r.Get("/api/v1/me/health-summary", api.healthSummary)
 		r.With(api.limitAIRequests).Post("/api/v1/analyses", api.upload)
 		r.Get("/api/v1/analyses/{id}", api.analysis)
 		r.Get("/api/v1/analyses/{id}/file", api.file)
@@ -723,7 +725,18 @@ func (a *API) healthSummary(w http.ResponseWriter, r *http.Request) {
 		write(w, 404, map[string]string{"error": "patient not found"})
 		return
 	}
-	result := a.analyzer.PatientHealthSummary(r.Context(), patient, list)
+	w.Header().Set("Cache-Control", "private, no-store")
+	result, err := cachedHealthSummary(r.Context(), &a.healthSummaries, a.store, u.ID, analyzer.HealthSummaryKey(list), func(ctx context.Context) (string, error) {
+		if allowed, retryAfter := a.aiLimiter.allow(u.ID.Hex(), time.Now().UTC()); !allowed {
+			return "", &healthSummaryLimitError{retryAfter: retryAfter}
+		}
+		generated, err := a.analyzer.PatientHealthSummary(ctx, patient, list)
+		return generated.Summary, err
+	})
+	if err != nil {
+		writeHealthSummaryError(w, err)
+		return
+	}
 	write(w, 200, result)
 }
 func (a *API) upload(w http.ResponseWriter, r *http.Request) {
