@@ -133,6 +133,9 @@ func (s *Service) finishVisionStudies(ctx context.Context, extracted visionExtra
 	}
 	results := make([]DocumentResult, 0, len(studies))
 	for _, study := range studies {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if len(study.Studies) > 0 {
 			return nil, fmt.Errorf("nested study groups are invalid")
 		}
@@ -159,6 +162,9 @@ func (s *Service) finishVisionStudies(ctx context.Context, extracted visionExtra
 			return nil, err
 		}
 		results = append(results, result)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	return results, nil
 }

@@ -64,6 +64,9 @@ func persistStudies(ctx context.Context, db studyStore, base domain.Analysis, re
 	}
 	items := make([]domain.Analysis, len(results))
 	paths := []string{}
+	if !replace {
+		paths = append(paths, base.StoragePath)
+	}
 	cleanup := func() {
 		for _, path := range paths {
 			_ = os.Remove(path)

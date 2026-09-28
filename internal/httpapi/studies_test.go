@@ -52,7 +52,7 @@ func TestPersistStudiesOwnFilesAndRollback(t *testing.T) {
 					t.Fatal("partial batch left after failed save")
 				}
 				files, _ := filepath.Glob(filepath.Join(filepath.Dir(base.StoragePath), "*"))
-				if len(files) != 1 {
+				if len(files) != 0 {
 					t.Fatal("child file not cleaned up")
 				}
 				return

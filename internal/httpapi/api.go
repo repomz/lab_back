@@ -727,6 +727,9 @@ func (a *API) healthSummary(w http.ResponseWriter, r *http.Request) {
 	write(w, 200, result)
 }
 func (a *API) upload(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 270*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
 	u := current(r)
 	if u.Role != domain.RolePatient {
 		write(w, 403, map[string]string{"error": "only patients can upload analyses"})
@@ -899,6 +902,9 @@ func (a *API) deleteAnalysis(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 func (a *API) reprocess(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 270*time.Second)
+	defer cancel()
+	r = r.WithContext(ctx)
 	u := current(r)
 	if u.Role != domain.RolePatient {
 		write(w, 403, map[string]string{"error": "only patients can reprocess analyses"})
