@@ -135,12 +135,13 @@ type AIReview struct {
 // explicit conclusion distinct prevents a language model from turning body
 // text into a diagnosis that was not present in the document.
 type StudyReport struct {
-	Modality    string   `bson:"modality" json:"modality"`
-	StudyName   string   `bson:"study_name" json:"study_name"`
-	Description string   `bson:"description" json:"description"`
-	Conclusion  string   `bson:"conclusion,omitempty" json:"conclusion,omitempty"`
-	Confidence  float64  `bson:"confidence,omitempty" json:"confidence,omitempty"`
-	Warnings    []string `bson:"warnings,omitempty" json:"warnings,omitempty"`
+	DocumentKind string   `bson:"document_kind,omitempty" json:"document_kind,omitempty"`
+	Modality     string   `bson:"modality" json:"modality"`
+	StudyName    string   `bson:"study_name" json:"study_name"`
+	Description  string   `bson:"description" json:"description"`
+	Conclusion   string   `bson:"conclusion,omitempty" json:"conclusion,omitempty"`
+	Confidence   float64  `bson:"confidence,omitempty" json:"confidence,omitempty"`
+	Warnings     []string `bson:"warnings,omitempty" json:"warnings,omitempty"`
 }
 
 const (

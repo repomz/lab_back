@@ -206,6 +206,7 @@ func (s *Service) verifyVisionExtraction(ctx context.Context, images []visionIma
 }
 
 const visionExtractionPrompt = `Прочитай все приложенные страницы и выдели каждое самостоятельное исследование.
+Определи тип каждого самостоятельного документа: laboratory — лабораторный анализ; diagnostic — инструментальное исследование (УЗИ, КТ, МРТ, ЭКГ и др.); discharge — выписка из стационара/выписной эпикриз; specialist — заключение или консультация врача-специалиста. Не называй выписки и заключения врачей УЗИ. Для discharge/specialist markers=[]; report сохраняет дословно медицинское содержание, диагнозы, назначения и рекомендации, без новых выводов; modality="", study_name — название документа/специальность. Не выделяй упомянутые в выписке прошлые анализы как самостоятельные бланки.
 Одна фотография или PDF может содержать 2, 3 и более разных исследований. Верни их отдельными элементами studies с собственными датой, показателями, описанием, заключением и названием.
 Разделяй по заголовкам бланков, виду исследования, биоматериалу, дате и номеру образца. ОАК с лейкоформулой и СОЭ одного образца оставь вместе; микроальбумин мочи на том же листе — отдельное исследование. УЗИ разных органов с самостоятельными протоколами разделяй. Продолжение одного бланка на следующей странице объедини. Не дублируй строки и не дроби один профиль на отдельные показатели. Не смешивай кровь и мочу.
 Требования к точности:
@@ -217,12 +218,15 @@ const visionExtractionPrompt = `Прочитай все приложенные �
 6. Для УЗИ, КТ, МРТ или рентгена дословно перепиши медицинское описание в report.description и формальное заключение в report.conclusion. Не превращай описание в собственный диагноз. Для лабораторного документа report=null.
 7. medical_text должен содержать аккуратную транскрипцию только медицинской части документа без ФИО, адреса, полиса, номера карты и иных идентификаторов пациента.
 8. collected_at — дата забора материала или дата исследования в YYYY-MM-DD; не дата рождения, печати или направления. Если её нет, пустая строка.
-9. title — короткое понятное название вида исследования, без перечисления всех строк бланка. category не является свободным текстом: выбери одну рубрику из «Кровь», «Моча», «УЗИ», «КТ и МРТ», «Рентген», «Другие анализы».
+9. title — короткое понятное название вида исследования, без перечисления всех строк бланка. category не является свободным текстом: выбери одну рубрику из «Кровь», «Моча», «УЗИ», «КТ и МРТ», «Рентген», «Другие исследования», «Другие анализы», «Выписки», «Заключения».
 Верни JSON {"studies":[...]} даже для одного исследования. Каждый элемент массива строго такой формы:
-{"document_type":"laboratory|diagnostic","title":"краткое название исследования","category":"категория","collected_at":"YYYY-MM-DD или пусто","medical_text":"транскрипция медицинской части","markers":[{"name":"как на бланке","canonical_name":"стабильное английское имя или транслитерация","value":null,"text_value":"","unit":"","reference_min":null,"reference_max":null,"reference_text":"","status":"low|normal|high|unknown"}],"report":null}
-Для диагностического исследования markers=[] и report={"modality":"УЗИ|КТ|МРТ|Рентген","study_name":"название","description":"дословное описание","conclusion":"дословное заключение","confidence":1,"warnings":[]}.`
+{"document_type":"laboratory|diagnostic|discharge|specialist","title":"краткое название исследования","category":"категория","collected_at":"YYYY-MM-DD или пусто","medical_text":"транскрипция медицинской части","markers":[{"name":"как на бланке","canonical_name":"стабильное английское имя или транслитерация","value":null,"text_value":"","unit":"","reference_min":null,"reference_max":null,"reference_text":"","status":"low|normal|high|unknown"}],"report":null}
+Для диагностического исследования markers=[] и report={"modality":"метод исследования: УЗИ, КТ, МРТ, Рентген, ЭКГ или иной явно указанный метод","study_name":"название","description":"дословное описание","conclusion":"дословное заключение","confidence":1,"warnings":[]}.`
 
 func (s *Service) finishVisionExtraction(ctx context.Context, extracted visionExtraction, profile *domain.PatientProfile) (DocumentResult, error) {
+	if len(extracted.Markers) > 0 && extracted.DocumentType != "" && extracted.DocumentType != "laboratory" {
+		return DocumentResult{}, fmt.Errorf("non-laboratory document contains laboratory markers instead of a report")
+	}
 	result := DocumentResult{
 		MedicalText: trimRunes(sanitizeMedicalText(extracted.MedicalText), 50000),
 		Title:       trimRunes(strings.TrimSpace(extracted.Title), 240),
@@ -253,6 +257,14 @@ func (s *Service) finishVisionExtraction(ctx context.Context, extracted visionEx
 		result.Review = s.ReviewMarkersForPatient(ctx, result.Markers, profile)
 	} else if extracted.Report != nil {
 		candidate := *extracted.Report
+		switch extracted.DocumentType {
+		case "discharge", "specialist":
+			candidate.DocumentKind = extracted.DocumentType
+		case "diagnostic", "":
+			candidate.DocumentKind = "diagnostic"
+		default:
+			return DocumentResult{}, fmt.Errorf("invalid narrative document type")
+		}
 		candidate.Description = sanitizeMedicalText(candidate.Description)
 		candidate.Conclusion = sanitizeMedicalText(candidate.Conclusion)
 		report, err := NormalizeConfirmedReport(&candidate)

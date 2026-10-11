@@ -11,6 +11,18 @@ import (
 // names and rubric sections. Provider-generated labels are deliberately not
 // used as categories: they vary between otherwise identical documents.
 func CanonicalAnalysisIdentity(markers []domain.Marker, medicalText string, report *domain.StudyReport) (string, string) {
+	if report != nil {
+		switch report.DocumentKind {
+		case "discharge":
+			return "Выписка из стационара", "Выписки"
+		case "specialist":
+			title := strings.TrimSpace(report.StudyName)
+			if title == "" {
+				title = "Заключение специалиста"
+			}
+			return title, "Заключения"
+		}
+	}
 	search := normalizedAnalysisText(markers, medicalText, report)
 	has := func(parts ...string) bool {
 		for _, part := range parts {
@@ -33,7 +45,9 @@ func CanonicalAnalysisIdentity(markers []domain.Marker, medicalText string, repo
 			return "Магнитно-резонансная томография", "КТ и МРТ"
 		case modality == "рентген" || has("рентген"):
 			return "Рентгенография", "Рентген"
-		default:
+		case modality == "экг" || has("электрокардиограмма", "электрокардиография"):
+			return "Электрокардиография", "Другие исследования"
+		case modality == "узи" || has("ультразвуков", "эхоскопически", "эхографически"):
 			if has("щитовидная железа", "щитовидной железы") {
 				return "УЗИ щитовидной железы", "УЗИ"
 			}
@@ -41,6 +55,12 @@ func CanonicalAnalysisIdentity(markers []domain.Marker, medicalText string, repo
 				return "УЗИ почек", "УЗИ"
 			}
 			return "Ультразвуковое исследование", "УЗИ"
+		default:
+			title := strings.TrimSpace(reportValue(report, func(value *domain.StudyReport) string { return value.StudyName }))
+			if title == "" {
+				title = "Инструментальное исследование"
+			}
+			return title, "Другие исследования"
 		}
 	}
 

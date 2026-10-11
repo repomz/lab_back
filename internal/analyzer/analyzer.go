@@ -272,6 +272,11 @@ func NormalizeConfirmedReport(report *domain.StudyReport) (*domain.StudyReport, 
 		return nil, fmt.Errorf("missing report")
 	}
 	normalized := *report
+	switch normalized.DocumentKind {
+	case "", "diagnostic", "discharge", "specialist":
+	default:
+		return nil, fmt.Errorf("invalid document kind")
+	}
 	normalized.Modality = strings.TrimSpace(normalized.Modality)
 	normalized.StudyName = strings.TrimSpace(normalized.StudyName)
 	normalized.Description = strings.TrimSpace(normalized.Description)
@@ -1311,6 +1316,10 @@ func studyRuleReview(report *domain.StudyReport) domain.AIReview {
 		return review
 	}
 	text := normalizeSearch(strings.Join([]string{report.StudyName, report.Description, report.Conclusion}, " "))
+	if report.DocumentKind == "discharge" || report.DocumentKind == "specialist" {
+		review.Summary = "Медицинский документ сохранён. Автоматическое объяснение сейчас недоступно; исходные заключения и рекомендации врача приведены в тексте документа."
+		return review
+	}
 	switch {
 	case containsAny(text, "пневмофиброз", "тэла", "легочная гипертензия", "лаг"):
 		review.Summary = "КТ фиксирует хронические изменения лёгких и признаки ранее перенесённой тромбоэмболии с лёгочной гипертензией. Это требует сопоставления с одышкой, сатурацией, сердечно‑сосудистым анамнезом и предыдущими снимками."
@@ -1442,7 +1451,7 @@ func (s *Service) deepSeekStudyReview(ctx context.Context, report *domain.StudyR
 		profileContext = fmt.Sprintf("Возраст %d лет, ИМТ %.1f.", profile.Age, profile.BMI)
 	}
 	input, err := json.Marshal(map[string]any{
-		"modality": report.Modality, "study_name": report.StudyName,
+		"document_kind": report.DocumentKind, "modality": report.Modality, "study_name": report.StudyName,
 		"description": report.Description, "conclusion": report.Conclusion,
 	})
 	if err != nil {
@@ -1451,7 +1460,7 @@ func (s *Service) deepSeekStudyReview(ctx context.Context, report *domain.StudyR
 	var out struct {
 		AIReview domain.AIReview `json:"ai_review"`
 	}
-	system := "Ты формируешь понятное пациенту медицинское резюме подтверждённого протокола УЗИ/КТ/МРТ/рентгена. Верни только JSON {ai_review:{summary,lifestyle:[],nutrition:[],recommendations:[],red_flags:[],doctor_needed,urgency,suggested_specialty}}. Не копируй заключение как единственное резюме. Объясни общую значимость находок простыми словами, отдели успокаивающие признаки от тех, которые требуют наблюдения, и предложи 1–3 конкретных следующих шага. Если формального заключения нет, всё равно оцени видимые факты из description, но прямо укажи ограничение. Не добавляй отсутствующие признаки, не ставь новый диагноз, не назначай лекарства или дозировки. Осторожные формулировки «может соответствовать» допустимы только как интерпретация явно описанного сочетания. red_flags заполняй только уместными симптомами для срочной помощи. lifestyle и nutrition — только когда они прямо следуют из протокола. urgency строго routine, soon или urgent."
+	system := "Ты формируешь понятное пациенту медицинское резюме подтверждённого медицинского документа: инструментального исследования, выписки из стационара или заключения специалиста. Учитывай document_kind. Для выписки отделяй перенесённые события от текущего состояния, объясняй план наблюдения; для заключения специалиста объясняй описанные находки и рекомендации, не отменяя назначений врача. Верни только JSON {ai_review:{summary,lifestyle:[],nutrition:[],recommendations:[],red_flags:[],doctor_needed,urgency,suggested_specialty}}. Не копируй заключение как единственное резюме. Объясни общую значимость находок простыми словами, отдели успокаивающие признаки от тех, которые требуют наблюдения, и предложи 1–3 конкретных следующих шага. Если формального заключения нет, всё равно оцени видимые факты из description, но прямо укажи ограничение. Не добавляй отсутствующие признаки, не ставь новый диагноз, не назначай лекарства или дозировки. Осторожные формулировки «может соответствовать» допустимы только как интерпретация явно описанного сочетания. red_flags заполняй только уместными симптомами для срочной помощи. lifestyle и nutrition — только когда они прямо следуют из протокола. urgency строго routine, soon или urgent."
 	if err = s.completeJSON(ctx, system, profileContext+"\nПодтверждённый протокол: "+string(input), &out); err != nil {
 		return domain.AIReview{}, err
 	}
