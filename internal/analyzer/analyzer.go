@@ -1596,6 +1596,10 @@ func (s *Service) ClinicalAssist(ctx context.Context, patient domain.User, objec
 }
 
 func (s *Service) DoctorChat(ctx context.Context, messages []domain.AIMessage) (string, error) {
+	return s.Chat(ctx, messages, domain.RoleDoctor)
+}
+
+func (s *Service) Chat(ctx context.Context, messages []domain.AIMessage, role domain.Role) (string, error) {
 	if s.cfg.DeepSeekAPIKey == "" {
 		return "", fmt.Errorf("ai service is not configured")
 	}
@@ -1607,6 +1611,9 @@ func (s *Service) DoctorChat(ctx context.Context, messages []domain.AIMessage) (
 		Reply string `json:"reply"`
 	}
 	system := "Ты — AI-помощник врача для клинического рассуждения. Отвечай по-русски, структурированно и кратко. Не выдумывай данные пациента, исследования, ссылки или актуальность рекомендаций. Явно отделяй факты от гипотез, отмечай красные флаги и недостающие данные. Не заменяй решение врача и не назначай конкретные препараты или дозировки. Если ссылаешься на руководство, проси сверить действующую редакцию в официальном источнике. Верни JSON с полем reply."
+	if role != domain.RoleDoctor {
+		system = "Ты — информационный AI-помощник пациента, не врача. Отвечай по-русски простым понятным языком. У тебя есть только история этой переписки, нет автоматического доступа к загруженным документам или профилю. Не утверждай, что просмотрел анализы, которых нет в сообщениях. Если для ответа нужны результаты, попроси значения, единицы, референсы и дату. Объясняй предоставленные факты, отделяй их от предположений, задавай уточняющие вопросы. Не ставь диагноз, не назначай препараты и дозировки, не отменяй лечение. Указывай уместные признаки для срочного обращения за помощью, не запугивай и не давай ложного успокоения. Не выдумывай ссылки и актуальность рекомендаций. Не заменяй консультацию врача. Верни JSON с полем reply."
+	}
 	err := s.completeJSON(ctx, system, "История диалога: "+string(conversation), &out)
 	if err != nil {
 		return "", err

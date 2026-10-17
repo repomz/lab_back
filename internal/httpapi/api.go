@@ -128,7 +128,7 @@ func (a *API) cors(next http.Handler) http.Handler {
 			}
 		}
 		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)
 			return
@@ -1621,7 +1621,7 @@ func (a *API) aiMessage(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC()
 	userMessage := domain.AIMessage{Role: "user", Content: strings.TrimSpace(in.Content), CreatedAt: now}
 	history := append(chat.Messages, userMessage)
-	reply, e := a.analyzer.DoctorChat(r.Context(), history)
+	reply, e := a.analyzer.Chat(r.Context(), history, u.Role)
 	if e != nil {
 		writeAIServiceError(w, e, 503, "AI temporarily unavailable")
 		return
